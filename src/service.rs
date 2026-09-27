@@ -1,9 +1,7 @@
-use std::net::ToSocketAddrs;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio_stream::{Stream, StreamExt};
-use tokio_util::codec::Framed;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status, Streaming};
