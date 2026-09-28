@@ -56,3 +56,11 @@ pub struct PullRequest {
     pub batch: Vec<Message>,
     pub poison_messages: Vec<Message>
 }
+
+#[derive(Debug, Clone)]
+pub struct PushConfig {
+    pub push_endpoint: String,
+    pub headers: HashMap<String, String>,
+    pub timeout_secs: u64 // Default to 5s
+}
+

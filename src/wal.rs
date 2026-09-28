@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::io::{BufRead, Write};
 use std::path::Path;
 use std::fs::{File, OpenOptions};
@@ -16,13 +17,16 @@ pub enum WalEntry {
         subscription: String,
         ack_deadline_sec: u64,
         #[serde(default)]
-        batch_size: Option<usize>,
+        batch_size: usize,
         #[serde(default)]
         max_outstanding_messages: Option<usize>,
         #[serde(default)]
         dead_letter_queue: Option<String>,
         #[serde(default)]
-        max_delivery_attempts: Option<u32>
+        max_delivery_attempts: Option<u32>,
+        push_endpoint: Option<String>,
+        headers: Option<HashMap<String, String>>,
+        timeout_secs: Option<u64>
     },
     Publish {
         topic: String,
@@ -119,10 +123,13 @@ mod tests {
             topic: "orders".to_string(),
             subscription: "inv-sub".to_string(),
             ack_deadline_sec: 10,
-            batch_size: Some(1),
+            batch_size: 1,
             max_outstanding_messages: None,
             dead_letter_queue: None,
-            max_delivery_attempts: None
+            max_delivery_attempts: None,
+            push_endpoint: None,
+            timeout_secs: None,
+            headers: None
         };
 
         // Append entries

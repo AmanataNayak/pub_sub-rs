@@ -49,17 +49,36 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 batch_size,
                 max_outstanding_messages,
                 dead_letter_queue,
-                max_delivery_attempts
+                max_delivery_attempts,
+                push_endpoint,
+                headers,
+                timeout_secs,
+
             } => {
-                let _ = engine.create_subscription(
-                    &topic,
-                    &subscription,
-                    Duration::from_secs(ack_deadline_sec),
-                    batch_size,
-                    max_outstanding_messages,
-                    dead_letter_queue,
-                    max_delivery_attempts
-                );
+                let ack_deadline = Duration::from_secs(ack_deadline_sec);
+                if let Some(pe) = push_endpoint {
+                    let _ = engine.create_push_subscription(
+                        &topic,
+                        &subscription,
+                        &pe,
+                        headers.unwrap(),
+                        timeout_secs,
+                        ack_deadline,
+                        max_outstanding_messages,
+                        dead_letter_queue,
+                        max_delivery_attempts,
+                    );
+                } else {
+                    let _ = engine.create_subscription(
+                        &topic,
+                        &subscription,
+                        ack_deadline,
+                        Some(batch_size),
+                        max_outstanding_messages,
+                        dead_letter_queue,
+                        max_delivery_attempts,
+                    );
+                }
             }
             WalEntry::Publish { topic, message } => {
                 let _ = engine.publish(&topic, message);

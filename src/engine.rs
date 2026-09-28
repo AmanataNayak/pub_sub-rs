@@ -8,10 +8,10 @@ use std::time::{
 use std::sync::{Arc, RwLock};
 use serde::{Deserialize, Serialize};
 use tokio::sync::Notify;
-use crate::model::{DeliveryState, Message, DeadLetterPolicy, PullRequest};
+use crate::model::{DeliveryState, Message, DeadLetterPolicy, PullRequest, PushConfig};
 use crate::errors::{PubSubError};
 use crate::wal::{WalEntry, WalManager};
-
+use crate::push::spawn_push_workers;
 
 
 pub struct Subscription {
@@ -19,6 +19,7 @@ pub struct Subscription {
     pub ack_deadline: Duration,
     // Store message data alongside its current state
     messages: HashMap<String, (Message, DeliveryState)>,
+    pub push_config: Option<PushConfig>,
     pub batch_size: usize,
     pub max_outstanding_messages: Option<usize>, // None
     pub dropped_messages: u64,
@@ -27,17 +28,31 @@ pub struct Subscription {
 }
 
 impl Subscription {
-    pub fn new(name: String, ack_deadline: Duration, batch_size: Option<usize>, max_outstanding_messages: Option<usize>, dead_letter_policy: Option<DeadLetterPolicy>) -> Self {
-        let effective_batch_size = batch_size.unwrap_or(1).max(1);
+    pub fn new(name: String, ack_deadline: Duration, batch_size: usize, max_outstanding_messages: Option<usize>, dead_letter_policy: Option<DeadLetterPolicy>) -> Self {
 
         Self {
             name,
             ack_deadline,
             messages: HashMap::new(),
-            batch_size: effective_batch_size,
+            batch_size,
             dropped_messages: 0,
             max_outstanding_messages,
             dead_letter_policy,
+            push_config: None,
+            notify: Arc::new(Notify::new())
+        }
+    }
+
+    pub fn new_push(name: String, ack_deadline: Duration, push_config: PushConfig, max_outstanding_messages: Option<usize>, dead_letter_policy: Option<DeadLetterPolicy>) -> Self {
+        Self {
+            name,
+            ack_deadline,
+            messages: HashMap::new(),
+            batch_size: 1,
+            dropped_messages: 0,
+            max_outstanding_messages,
+            dead_letter_policy,
+            push_config: Some(push_config),
             notify: Arc::new(Notify::new())
         }
     }
@@ -162,7 +177,7 @@ impl Topic {
     }
 
     /// Register a new subscription under this topic
-    pub fn create_subscription(&mut self, name: &str, ack_deadline: Duration, batch_size: Option<usize>, max_outstanding_messages: Option<usize>, dead_letter_policy: Option<DeadLetterPolicy>,) -> bool {
+    pub fn create_subscription(&mut self, name: &str, ack_deadline: Duration, batch_size: usize, max_outstanding_messages: Option<usize>, dead_letter_policy: Option<DeadLetterPolicy>,) -> bool {
         if self.subscription.contains_key(name) {
             return false; // Already exists
         }
@@ -174,6 +189,24 @@ impl Topic {
             dead_letter_policy
         );
         self.subscription.insert(name.to_string(), sub);
+        true
+    }
+
+    pub fn create_push_subscription(&mut self, name: &str, ack_deadline: Duration, push_config: PushConfig, max_outstanding_messages: Option<usize>, dead_letter_policy: Option<DeadLetterPolicy>) -> bool {
+        if self.subscription.contains_key(name) {
+            return false; // Already exits
+        }
+
+        let sub = Subscription::new_push(
+            name.to_string(),
+            ack_deadline,
+            push_config,
+            max_outstanding_messages,
+            dead_letter_policy
+        );
+
+        self.subscription.insert(name.to_string(), sub);
+
         true
     }
 
@@ -274,6 +307,7 @@ impl Engine {
             return Err(PubSubError::SubscriptionAlreadyExists(sub_name.to_string()));
         }
 
+        let batch_size = batch_size.unwrap_or(1);
         if let Some(wal) = &self.wal {
             let entry = WalEntry::CreateSubscription {
                 topic: topic_name.to_string(),
@@ -282,7 +316,10 @@ impl Engine {
                 batch_size,
                 max_outstanding_messages,
                 dead_letter_queue: dead_letter_policy.as_ref().map(|p| p.dead_letter_queue.clone()),
-                max_delivery_attempts
+                max_delivery_attempts,
+                push_endpoint: None,
+                timeout_secs: None,
+                headers: None
             };
             wal.append(&entry)
                 .map_err(|e| PubSubError::IoError(e.to_string()))?;
@@ -296,6 +333,75 @@ impl Engine {
             dead_letter_policy,
         );
 
+
+        Ok(())
+    }
+
+    pub fn create_push_subscription(&self, topic_name: &str, sub_name: &str, push_endpoint: &str, headers: HashMap<String, String>, timeout_secs: Option<u64>, ack_deadline: Duration, max_outstanding_messages: Option<usize>, dead_letter_queue: Option<String>, max_delivery_attempts: Option<u32>) -> Result<(), PubSubError> {
+        // Validate DLQ
+        let dead_letter_policy = if let Some(dlq_name) = dead_letter_queue {
+            if self.get_topic(&dlq_name).is_err() {
+                return Err(PubSubError::TopicNotFound(dlq_name))
+            }
+
+            Some(DeadLetterPolicy {
+                dead_letter_queue: dlq_name,
+                max_delivery_attempts: max_delivery_attempts.unwrap_or(5)
+            })
+
+        } else {
+            None
+        };
+
+        let push_config = PushConfig {
+            push_endpoint: push_endpoint.to_string(),
+            headers,
+            timeout_secs: timeout_secs.unwrap_or(5),
+        };
+
+        if let Some(wal) = &self.wal {
+            let entry = WalEntry::CreateSubscription {
+                topic: topic_name.to_string(),
+                subscription: sub_name.to_string(),
+                ack_deadline_sec: ack_deadline.as_secs(),
+                batch_size: 1,
+                max_outstanding_messages,
+                dead_letter_queue: dead_letter_policy.as_ref().map(|p| p.dead_letter_queue.clone()),
+                max_delivery_attempts,
+                push_endpoint: Some(push_config.push_endpoint.clone()),
+                timeout_secs: Some(push_config.timeout_secs),
+                headers: Some(push_config.headers.clone()),
+            };
+            wal.append(&entry)
+                .map_err(|e| PubSubError::IoError(e.to_string()))?;
+        }
+
+        let notify = {
+            let mut topic_arc = self.get_topic(topic_name)?;
+            let mut topic = topic_arc.write().unwrap();
+
+            if topic.subscription.contains_key(sub_name) {
+                return Err(PubSubError::SubscriptionAlreadyExists(sub_name.to_string()));
+            }
+
+            topic.create_push_subscription(
+                sub_name,
+                ack_deadline,
+                push_config.clone(),
+                max_outstanding_messages,
+                dead_letter_policy,
+            );
+            topic.get_subscription(sub_name).unwrap().notify_handler()
+        };
+
+        // Spawn the background push worker
+        spawn_push_workers(
+            topic_name.to_string(),
+            sub_name.to_string(),
+            push_config.clone(),
+            notify,
+            self.clone()
+        );
 
         Ok(())
     }
@@ -397,7 +503,7 @@ mod subscription_tests {
 
     #[test]
     fn test_empty_subscription_pull() {
-        let mut sub = Subscription::new("sub-empty".to_string(), Duration::from_secs(10), Some(5), None, None);
+        let mut sub = Subscription::new("sub-empty".to_string(), Duration::from_secs(10), 5, None, None);
 
         let batch = sub.pull_batch(None, "");
         assert!(batch.batch.is_empty());
@@ -408,7 +514,7 @@ mod subscription_tests {
 
     #[test]
     fn test_batch_size_boundaries() {
-        let mut sub = Subscription::new("sub-bounds".to_string(), Duration::from_secs(10), Some(2), None, None);
+        let mut sub = Subscription::new("sub-bounds".to_string(), Duration::from_secs(10), 2, None, None);
 
         for i in 1..10 {
             sub.push(dummy_msg(&format!("msg-{i}")));
@@ -432,7 +538,7 @@ mod subscription_tests {
 
     #[test]
     fn test_double_ack_and_invalid_ack() {
-        let mut sub = Subscription::new("sub-ack".to_string(), Duration::from_secs(10), Some(1), None, None);
+        let mut sub = Subscription::new("sub-ack".to_string(), Duration::from_secs(10), 1, None, None);
         let msg = dummy_msg("hello");
         let msg_id = msg.id.clone();
         sub.push(msg);
@@ -454,7 +560,7 @@ mod subscription_tests {
     #[test]
     fn test_visibility_expiration_and_attempt_counter() {
         // Fast 30ms visibility deadline
-        let mut sub = Subscription::new("sub-ttl".to_string(), Duration::from_millis(30), Some(10), None, None);
+        let mut sub = Subscription::new("sub-ttl".to_string(), Duration::from_millis(30), 10, None, None);
 
         let msg1 = dummy_msg("msg-1");
         let msg1_id = msg1.id.clone();
@@ -483,7 +589,7 @@ mod subscription_tests {
         let mut sub = Subscription::new(
             "sub-cap".to_string(),
             Duration::from_secs(10),
-            Some(10), // batch_size
+            10, // batch_size
             Some(2),  // max_outstanding_messages
             None
         );
@@ -537,8 +643,8 @@ mod topic_tests {
     fn test_fanout_isolation_and_independent_acks() {
         let mut topic = Topic::new("orders".to_string());
 
-        topic.create_subscription("sub-billing", Duration::from_secs(10), Some(5), None, None);
-        topic.create_subscription("sub-analytics", Duration::from_secs(10), Some(5), None, None);
+        topic.create_subscription("sub-billing", Duration::from_secs(10), 5, None, None);
+        topic.create_subscription("sub-analytics", Duration::from_secs(10), 5, None, None);
 
         let msg = dummy_msg("Order #99");
         let msg_id = msg.id.clone();
@@ -574,9 +680,9 @@ mod topic_tests {
         let mut topic = Topic::new("orders".to_string());
 
         // Sub A: Unbounded (None)
-        topic.create_subscription("sub-unbounded", Duration::from_secs(10), Some(10), None, None);
+        topic.create_subscription("sub-unbounded", Duration::from_secs(10), 10, None, None);
         // Sub B: Capped at 1 message
-        topic.create_subscription("sub-capped", Duration::from_secs(10), Some(10), Some(1), None);
+        topic.create_subscription("sub-capped", Duration::from_secs(10), 10, Some(1), None);
 
         let msg1 = dummy_msg("Order #1");
         let msg2 = dummy_msg("Order #2");
@@ -609,6 +715,9 @@ mod engine_tests {
     use std::collections::HashMap;
     use std::sync::Arc;
     use std::thread;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+    use tokio::sync::mpsc;
 
 
     fn dummy_msg(payload_str: &str) -> Message {
@@ -678,8 +787,7 @@ mod engine_tests {
                 for _ in 0..30 {
                     if let Ok(msgs) = engine_clone.pull_batch("events", "sub-workers", Some(5)) {
                         for m in msgs {
-                            if engine_clone.ack("events", "sub-workers", &m.id).is_ok() {
-                            }
+                            if engine_clone.ack("events", "sub-workers", &m.id).is_ok() {}
                         }
                     }
                     thread::sleep(Duration::from_millis(1));
@@ -771,6 +879,93 @@ mod engine_tests {
         assert_eq!(
             dlt_msg.attributes.get("x-dead-letter-delivery-attempts").unwrap(),
             "2"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_push_webhook_delivery_and_headers() {
+        // 1. Bind local mock HTTP server to an ephemeral port
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let endpoint = format!("http://{}", addr);
+
+        // Channel to pass captured raw HTTP request from server task to test assertion
+        let (tx, mut rx) = mpsc::channel::<String>(1);
+
+        tokio::spawn(async move {
+            if let Ok((mut socket, _)) = listener.accept().await {
+                let mut buf = [0u8; 2048];
+                let n = socket.read(&mut buf).await.unwrap();
+                let request_text = String::from_utf8_lossy(&buf[..n]).to_string();
+
+                // Pass captured HTTP request back to main test runner
+                tx.send(request_text).await.unwrap();
+
+                // Return HTTP 200 OK response
+                let response = "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n";
+                socket.write_all(response.as_bytes()).await.unwrap();
+            }
+        });
+
+        // 2. Initialize Engine & Topic
+        let engine = Engine::new();
+        engine.create_topic("orders").unwrap();
+
+        // 3. Configure Custom Headers & Create Push Subscription
+        let mut custom_headers = HashMap::new();
+        custom_headers.insert("Authorization".to_string(), "Bearer test-token-123".to_string());
+
+        engine
+            .create_push_subscription(
+                "orders",
+                "sub-push-test",
+                &endpoint,
+                custom_headers,
+                Some(5),                 // timeout_secs
+                Duration::from_secs(10), // ack_deadline
+                None,                    // max_outstanding_messages
+                None,                    // dead_letter_queue
+                Some(5),                 // max_delivery_attempts
+            )
+            .unwrap();
+
+        // 4. Publish Message to Topic
+        let msg_payload = b"Push Delivery Payload".to_vec();
+        engine
+            .publish(
+                "orders",
+                Message {
+                    id: "msg-push-001".to_string(),
+                    payload: msg_payload,
+                    attributes: HashMap::new(),
+                    delivery_attempt: 0,
+                },
+            )
+            .unwrap();
+
+        // 5. Await HTTP Request at Mock Server
+        let req_raw = tokio::time::timeout(Duration::from_secs(3), rx.recv())
+            .await
+            .expect("Webhook endpoint did not receive HTTP POST within timeout")
+            .expect("Channel closed prematurely");
+
+        let req_lower = req_raw.to_lowercase();
+
+        // 6. Assert HTTP Method, Headers, and Payload
+        assert!(req_raw.starts_with("POST"));
+        assert!(req_lower.contains("authorization: bearer test-token-123"));
+        assert!(req_lower.contains("x-pubsub-message-id: msg-push-001"));
+        assert!(req_lower.contains("x-pubsub-subscription: sub-push-test"));
+        assert!(req_raw.contains("Push Delivery Payload"));
+
+        // 7. Verify Message Was Auto-ACKed
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let pending = engine
+            .pull_batch("orders", "sub-push-test", Some(1))
+            .unwrap();
+        assert!(
+            pending.is_empty(),
+            "Message should be auto-ACKed after receiving HTTP 200 OK"
         );
     }
 }
