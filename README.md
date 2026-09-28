@@ -27,3 +27,16 @@ A lightweight, fast Pub/Sub system written in Rust using Tokio and Tonic (gRPC).
                                                 ▼                                     ▼
                                       [ Streaming Pull ]                      [ Push Webhook ]
                                        (gRPC / Python)                       (HTTP POST Endpoint)
+
+```
+## Performance Benchmark
+
+Benchmarked on local loopback with 8 producer tasks and 8 consumer tasks handling **500,000 messages** (256 bytes payload, Pull batch size of 100):
+
+| Metric | Throughput | Bandwidth | Duration |
+| :--- | :--- | :--- | :--- |
+| **Publish Rate** | **436,774 msgs/sec** | **106.63 MB/s** | 1.145s |
+| **Consume (Pull + ACK)** | **23,699 msgs/sec** | **5.79 MB/s** | 21.098s |
+| **Total Benchmark Time** | — | — | **22.243s** |
+
+> **Note:** The current delivery tracking architecture introduces lock overhead during high-frequency individual ACKs. Optimization of the ACK state machine is actively in progress.
