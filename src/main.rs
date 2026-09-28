@@ -81,33 +81,3 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-// fn handle_command(engine: &Engine, cmd: Command) -> Response {
-//     match cmd {
-//         Command::CreateTopic { topic } => match engine.create_topic(&topic) {
-//             Ok(()) => Response::Ok,
-//             Err(err) => Response::Error(err.to_string())
-//         }
-//         Command::CreateSubscription { topic, subscription, ack_deadline_secs } => {
-//             match engine.create_subscription(&topic, &subscription, Duration::from_secs(ack_deadline_secs)) {
-//                 Ok(()) => Response::Ok,
-//                 Err(err) => Response::Error(err.to_string()),
-//             }
-//         }
-//         Command::Publish { topic, payload, attributes} => {
-//             let msg = Message::new(payload, attributes);
-//             match engine.publish(&topic, msg) {
-//                 Ok(_) => Response::Ok,
-//                 Err(err) => Response::Error(err.to_string())
-//             }
-//         }
-//         Command::Pull { topic, subscription } => match engine.pull(&topic, &subscription) {
-//             Ok(Some(msg)) => Response::Message(msg),
-//             Ok(None) => Response::Ok, // Queue empty
-//             Err(err) => Response::Error(err.to_string())
-//         }
-//         Command::Ack { topic, subscription, message_id } => match engine.ack(&topic, &subscription, &message_id) {
-//              Ok(()) => Response::Ok,
-//             Err(err) => Response::Error(err.to_string())
-//         }
-//     }
-// }

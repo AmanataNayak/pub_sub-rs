@@ -44,35 +44,6 @@ impl Subscription {
         self.notify.notify_waiters();
     }
 
-    /// Pulls the next available message (either Ready or expired InFlight)
-    // pub fn pull(&mut self) -> Option<Message>{
-    //     let now = Instant::now();
-    //
-    //     // 1. Look for message that is ready or has timed out
-    //     for (msg, state) in self.messages.values_mut() {
-    //         let is_available = match state {
-    //             DeliveryState::Ready => true,
-    //             DeliveryState::InFlight { deadline } => now >= *deadline,
-    //         };
-    //
-    //         if is_available {
-    //             // 2. Increment delivery attempts
-    //             msg.delivery_attempt += 1;
-    //
-    //             // 3. Mark an Inflight with a fresh deadline
-    //             let new_deadline = now + self.ack_deadline;
-    //             *state = DeliveryState::InFlight {
-    //                 deadline: new_deadline
-    //             };
-    //
-    //             // 4. Return the updated message to caller
-    //             return Some(msg.clone());
-    //         }
-    //     }
-    //     // No message available for pickup right now
-    //     None
-    // }
-
     /// Pulls message up to request_batch_size
     /// Falls back to self.batch_size if request_batch_size is None or 0
     pub fn pull_batch(&mut self, request_batch_size: Option<usize>) -> Vec<Message> {
