@@ -11,6 +11,11 @@ service PubSubService {
   rpc StreamingPull(stream StreamingPullRequest) returns (stream StreamingPullResponse);
 }
 
+message DeadLetterPolicy {
+  string dead_letter_queue = 1;
+  optional uint32 max_delivery_attempts = 2;
+}
+
 message CreateTopicRequest {
   string topic = 1;
 }
@@ -19,11 +24,14 @@ message CreateTopicResponse {
   bool success = 1;
 }
 
+
 message CreateSubscriptionRequest {
   string topic = 1;
   string subscription = 2;
   uint64 ack_deadline_secs = 3;
   optional uint32 batch_size = 4;
+  optional uint32 max_outstanding_messages = 5;
+  optional DeadLetterPolicy dead_letter_policy = 6;
 }
 
 message CreateSubscriptionResponse {

@@ -6,22 +6,37 @@ use std::time::{
     Instant,
 };
 use std::sync::{Arc, RwLock};
+use serde::{Deserialize, Serialize};
 use tokio::sync::Notify;
 use crate::model::{DeliveryState, Message};
 use crate::errors::{PubSubError};
 use crate::wal::{WalEntry, WalManager};
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeadLetterPolicy {
+    pub dead_letter_queue: String,
+    pub max_delivery_attempts: u32,
+}
+
+pub struct PullRequest {
+    pub batch: Vec<Message>,
+    pub poison_messages: Vec<Message>
+}
 
 pub struct Subscription {
     pub name: String,
     pub ack_deadline: Duration,
     // Store message data alongside its current state
     messages: HashMap<String, (Message, DeliveryState)>,
-    batch_size: usize,
+    pub batch_size: usize,
+    pub max_outstanding_messages: Option<usize>, // None
+    pub dropped_messages: u64,
+    pub dead_letter_policy: Option<DeadLetterPolicy>,
     pub notify: Arc<Notify>
 }
 
 impl Subscription {
-    pub fn new(name: String, ack_deadline: Duration, batch_size: Option<usize>) -> Self {
+    pub fn new(name: String, ack_deadline: Duration, batch_size: Option<usize>, max_outstanding_messages: Option<usize>, dead_letter_policy: Option<DeadLetterPolicy>) -> Self {
         let effective_batch_size = batch_size.unwrap_or(1).max(1);
 
         Self {
@@ -29,8 +44,15 @@ impl Subscription {
             ack_deadline,
             messages: HashMap::new(),
             batch_size: effective_batch_size,
+            dropped_messages: 0,
+            max_outstanding_messages,
+            dead_letter_policy,
             notify: Arc::new(Notify::new())
         }
+    }
+
+    pub fn len(&self) -> usize {
+        self.messages.len()
     }
 
     /// Expose the notify handlers so stream handers can wait on it
@@ -39,14 +61,23 @@ impl Subscription {
     }
 
     /// Called when a topic fan-outs a new message to this subscription.
-    pub fn push(&mut self, msg: Message) {
-        self.messages.insert(msg.id.clone(), (msg, DeliveryState::Ready));
-        self.notify.notify_waiters();
+    pub fn push(&mut self, msg: Message) -> bool {
+        match self.max_outstanding_messages {
+            Some(cap) if self.len() >= cap => {
+                self.dropped_messages += 1;
+                false
+            },
+            _ => {
+                self.messages.insert(msg.id.clone(), (msg, DeliveryState::Ready));
+                self.notify.notify_waiters();
+                true
+            }
+        }
     }
 
     /// Pulls message up to request_batch_size
     /// Falls back to self.batch_size if request_batch_size is None or 0
-    pub fn pull_batch(&mut self, request_batch_size: Option<usize>) -> Vec<Message> {
+    pub fn pull_batch(&mut self, request_batch_size: Option<usize>, topic_name: &str) -> PullRequest {
         let max_items = match request_batch_size {
             Some(n) if n > 0 => n,
             _ => self.batch_size,
@@ -54,26 +85,65 @@ impl Subscription {
 
         let mut batch = Vec::with_capacity(max_items);
         let now = Instant::now();
+        let mut keys_to_remove = Vec::new();
+        let mut poison_messages = Vec::new();
 
-        for (msg, state) in self.messages.values_mut() {
-            if batch.len() >= max_items {
-                break;
-            }
+        for (id, (msg, state)) in self.messages.iter_mut() {
+
 
             let is_available = match state {
                 DeliveryState::Ready => true,
                 DeliveryState::InFlight { deadline} => now >= *deadline
             };
 
+
             if is_available {
-                msg.delivery_attempt += 1;
-                *state = DeliveryState::InFlight {
-                    deadline: now + self.ack_deadline, //language= update the deadline
-                };
-                batch.push(msg.clone());
+                if let Some(ref dlp) = self.dead_letter_policy {
+                    if msg.delivery_attempt >= dlp.max_delivery_attempts {
+                        // Mark key for removal from HashMap
+                        keys_to_remove.push(id.clone());
+
+                        // Enrich metadata attributes
+                        msg.attributes.insert(
+                            "x-dead-letter-source-subscription".to_string(),
+                            self.name.clone()
+                        );
+
+                        msg.attributes.insert(
+                            "x-dead-letter-delivery-attempts".to_string(),
+                            msg.delivery_attempt.to_string()
+                        );
+
+                        msg.attributes.insert(
+                            "x-dead-letter-source-topic".to_string(),
+                            topic_name.to_string()
+                        );
+
+                        msg.attributes.insert(
+                            "x-dead-letter-original-message-id".to_string(),
+                            msg.id.clone()
+                        );
+                        poison_messages.push(msg.clone());
+                        continue;
+                    }
+                }
+                if batch.len() < max_items {
+                    msg.delivery_attempt += 1;
+                    *state = DeliveryState::InFlight {
+                        deadline: now + self.ack_deadline, //language= update the deadline
+                    };
+                    batch.push(msg.clone());
+                }
             }
         }
-        batch
+
+        for key in keys_to_remove {
+            self.messages.remove(&key);
+        }
+        PullRequest {
+            batch,
+            poison_messages
+        }
     }
 
     /// Remove the message in case of acknowledgment
@@ -101,14 +171,16 @@ impl Topic {
     }
 
     /// Register a new subscription under this topic
-    pub fn create_subscription(&mut self, name: &str, ack_deadline: Duration, batch_size: Option<usize>) -> bool {
+    pub fn create_subscription(&mut self, name: &str, ack_deadline: Duration, batch_size: Option<usize>, max_outstanding_messages: Option<usize>, dead_letter_policy: Option<DeadLetterPolicy>,) -> bool {
         if self.subscription.contains_key(name) {
             return false; // Already exists
         }
         let sub = Subscription::new(
             name.to_string(),
             ack_deadline,
-            batch_size
+            batch_size,
+            max_outstanding_messages,
+            dead_letter_policy
         );
         self.subscription.insert(name.to_string(), sub);
         true
@@ -188,26 +260,52 @@ impl Engine {
     }
 
     /// Creates a subscription under a topic.
-    pub fn create_subscription(&self, topic_name: &str, sub_name: &str, ack_deadline: Duration, batch_size: Option<usize>) -> Result<(), PubSubError> {
+    pub fn create_subscription(&self, topic_name: &str, sub_name: &str, ack_deadline: Duration, batch_size: Option<usize>, max_outstanding_messages: Option<usize>, dead_letter_queue: Option<String>, max_delivery_attempts: Option<u32>) -> Result<(), PubSubError> {
         let topic_arc = self.get_topic(topic_name)?;
 
+        // Build DLQ Policy ONLY if a dead_letter_queue was explicitly provided
+        let dead_letter_policy = if let Some(dlq_name) = dead_letter_queue {
+            if self.get_topic(&dlq_name).is_err() {
+                return Err(PubSubError::TopicNotFound(dlq_name))
+            }
+
+            Some(DeadLetterPolicy {
+                dead_letter_queue: dlq_name,
+                max_delivery_attempts: max_delivery_attempts.unwrap_or(5)
+            })
+
+        } else {
+            None
+        };
         let mut topic = topic_arc.write().unwrap();
 
         if topic.subscription.contains_key(sub_name) {
             return Err(PubSubError::SubscriptionAlreadyExists(sub_name.to_string()));
         }
+
         if let Some(wal) = &self.wal {
             let entry = WalEntry::CreateSubscription {
                 topic: topic_name.to_string(),
                 subscription: sub_name.to_string(),
                 ack_deadline_sec: ack_deadline.as_secs(),
-                batch_size: batch_size.unwrap_or(1)
+                batch_size,
+                max_outstanding_messages,
+                dead_letter_queue: dead_letter_policy.as_ref().map(|p| p.dead_letter_queue.clone()),
+                max_delivery_attempts
             };
             wal.append(&entry)
                 .map_err(|e| PubSubError::IoError(e.to_string()))?;
         }
 
-        topic.create_subscription(sub_name, ack_deadline, batch_size);
+        topic.create_subscription(
+            sub_name,
+            ack_deadline,
+            batch_size,
+            max_outstanding_messages,
+            dead_letter_policy,
+        );
+
+
         Ok(())
     }
 
@@ -232,14 +330,26 @@ impl Engine {
 
     /// Pulls a message from a specific subscription.
     pub fn pull_batch(&self, topic_name: &str, sub_name: &str, batch_size_override: Option<usize>) -> Result<Vec<Message>, PubSubError> {
-        let topic_arc = self.get_topic(topic_name)?;
-        let mut topic = topic_arc.write().unwrap();
+        let (batch, poison_messages, dlq_policy) = {
+            let topic_arc = self.get_topic(topic_name)?;
+            let mut topic = topic_arc.write().unwrap();
 
-        let sub = topic
-            .get_subscription_mut(sub_name)
-            .ok_or_else(|| PubSubError::SubscriptionNotFound(sub_name.to_string()))?;
+            let sub = topic
+                .get_subscription_mut(sub_name)
+                .ok_or_else(|| PubSubError::SubscriptionNotFound(sub_name.to_string()))?;
 
-        Ok(sub.pull_batch(batch_size_override))
+            let res = sub.pull_batch(batch_size_override, topic_name);
+
+            (res.batch, res.poison_messages, sub.dead_letter_policy.clone())
+        }; // Write lock on `topic` is explicitly dropped right here!
+
+        // Publish to DLQ outside the topic
+        if let Some(dlq_policy) = dlq_policy {
+            for msg in poison_messages {
+                let _ = self.publish(&dlq_policy.dead_letter_queue, msg);
+            }
+        }
+        Ok(batch)
     }
 
     /// Acknowledges a message on a subscription
@@ -288,7 +398,6 @@ impl Engine {
 mod subscription_tests {
     use super::*;
     use std::collections::HashMap;
-    use std::fmt::format;
     use std::thread::sleep;
 
     fn dummy_msg(payload_str: &str) -> Message {
@@ -297,42 +406,42 @@ mod subscription_tests {
 
     #[test]
     fn test_empty_subscription_pull() {
-        let mut sub = Subscription::new("sub-empty".to_string(), Duration::from_secs(10), Some(5));
+        let mut sub = Subscription::new("sub-empty".to_string(), Duration::from_secs(10), Some(5), None, None);
 
-        let batch = sub.pull_batch(None);
-        assert!(batch.is_empty());
+        let batch = sub.pull_batch(None, "");
+        assert!(batch.batch.is_empty());
 
-        let batch_zero = sub.pull_batch(Some(0));
-        assert!(batch_zero.is_empty());
+        let batch_zero = sub.pull_batch(Some(0), "");
+        assert!(batch_zero.batch.is_empty());
     }
 
     #[test]
     fn test_batch_size_boundaries() {
-        let mut sub = Subscription::new("sub-bounds".to_string(), Duration::from_secs(10), Some(2));
+        let mut sub = Subscription::new("sub-bounds".to_string(), Duration::from_secs(10), Some(2), None, None);
 
         for i in 1..10 {
             sub.push(dummy_msg(&format!("msg-{i}")));
         }
 
         // batch_size = 0 should return self.size element
-        let batch_zero = sub.pull_batch(Some(0));
-        assert_eq!(batch_zero.len(), 2);
+        let batch_zero = sub.pull_batch(Some(0), "");
+        assert_eq!(batch_zero.batch.len(), 2);
 
         // batch_size = None should return self.size element
-        let batch_none = sub.pull_batch(None);
-        assert_eq!(batch_none.len(), 2);
+        let batch_none = sub.pull_batch(None, "");
+        assert_eq!(batch_none.batch.len(), 2);
 
         // batch_size larger than remaining items
-        let batch_size = sub.pull_batch(Some(100));
-        assert_eq!(batch_size.len(), 5);
+        let batch_size = sub.pull_batch(Some(100), "");
+        assert_eq!(batch_size.batch.len(), 5);
 
         // Edge case 4: Queue is now empty
-        assert!(sub.pull_batch(None).is_empty());
+        assert!(sub.pull_batch(None, "").batch.is_empty());
     }
 
     #[test]
     fn test_double_ack_and_invalid_ack() {
-        let mut sub = Subscription::new("sub-ack".to_string(), Duration::from_secs(10), Some(1));
+        let mut sub = Subscription::new("sub-ack".to_string(), Duration::from_secs(10), Some(1), None, None);
         let msg = dummy_msg("hello");
         let msg_id = msg.id.clone();
         sub.push(msg);
@@ -341,8 +450,8 @@ mod subscription_tests {
         assert!(!sub.ack("non-existent-uuid"));
 
         // Pull the message to move it to InFlight
-        let pulled = sub.pull_batch(None);
-        assert_eq!(pulled.len(), 1);
+        let pulled = sub.pull_batch(None, "");
+        assert_eq!(pulled.batch.len(), 1);
 
         // case 2: First ACK succeeds
         assert!(sub.ack(&msg_id));
@@ -354,29 +463,64 @@ mod subscription_tests {
     #[test]
     fn test_visibility_expiration_and_attempt_counter() {
         // Fast 30ms visibility deadline
-        let mut sub = Subscription::new("sub-ttl".to_string(), Duration::from_millis(30), Some(10));
+        let mut sub = Subscription::new("sub-ttl".to_string(), Duration::from_millis(30), Some(10), None, None);
 
         let msg1 = dummy_msg("msg-1");
         let msg1_id = msg1.id.clone();
         sub.push(msg1);
 
         // 1st Pull: attempt counter = 1
-        let batch1 = sub.pull_batch(None);
-        assert_eq!(batch1[0].delivery_attempt, 1);
+        let batch1 = sub.pull_batch(None, "");
+        assert_eq!(batch1.batch[0].delivery_attempt, 1);
 
         // Immediate pull returns empty (msg1 is InFlight)
-        assert!(sub.pull_batch(None).is_empty());
+        assert!(sub.pull_batch(None, "").batch.is_empty());
 
         // Wait for deadline to expire (40ms > 30ms)
         sleep(Duration::from_millis(40));
 
         // 2nd Pull: msg1 re-claimed, attempt counter = 2
-        let batch2 = sub.pull_batch(None);
+        let batch2 = sub.pull_batch(None, "").batch;
         assert_eq!(batch2.len(), 1);
         assert_eq!(batch2[0].id, msg1_id);
         assert_eq!(batch2[0].delivery_attempt, 2);
     }
 
+    #[test]
+    fn test_subscription_capacity_limit_and_ack_drain() {
+        // Create a subscription capped at max 2 outstanding messages
+        let mut sub = Subscription::new(
+            "sub-cap".to_string(),
+            Duration::from_secs(10),
+            Some(10), // batch_size
+            Some(2),  // max_outstanding_messages
+            None
+        );
+
+        assert_eq!(sub.dropped_messages, 0);
+
+        // Push 1 and 2: Should succeed
+        assert!(sub.push(dummy_msg("msg-1")));
+        assert!(sub.push(dummy_msg("msg-2")));
+        assert_eq!(sub.len(), 2);
+
+        // Push 3: Should fail (full) and increment dropped_messages counter
+        assert!(!sub.push(dummy_msg("msg-3")));
+        assert_eq!(sub.len(), 2);
+        assert_eq!(sub.dropped_messages, 1);
+
+        // Pull 1 message and ACK it to free up capacity
+        let batch = sub.pull_batch(Some(1), "").batch;
+        assert_eq!(batch.len(), 1);
+        let msg_id = batch[0].id.clone();
+        assert!(sub.ack(&msg_id));
+        assert_eq!(sub.len(), 1);
+
+        // Push 4: Space is freed, should succeed now
+        assert!(sub.push(dummy_msg("msg-4")));
+        assert_eq!(sub.len(), 2);
+        assert_eq!(sub.dropped_messages, 1); // dropped counter stays at 1
+    }
 }
 
 
@@ -402,8 +546,8 @@ mod topic_tests {
     fn test_fanout_isolation_and_independent_acks() {
         let mut topic = Topic::new("orders".to_string());
 
-        topic.create_subscription("sub-billing", Duration::from_secs(10), Some(5));
-        topic.create_subscription("sub-analytics", Duration::from_secs(10), Some(5));
+        topic.create_subscription("sub-billing", Duration::from_secs(10), Some(5), None, None);
+        topic.create_subscription("sub-analytics", Duration::from_secs(10), Some(5), None, None);
 
         let msg = dummy_msg("Order #99");
         let msg_id = msg.id.clone();
@@ -412,13 +556,13 @@ mod topic_tests {
         // Both subscriptions must receive their own copy
         let billing_msgs = {
             let sub = topic.get_subscription_mut("sub-billing").unwrap();
-            sub.pull_batch(None)
+            sub.pull_batch(None, "orders").batch
         };
         assert_eq!(billing_msgs.len(), 1);
 
         let analytics_msgs = {
             let sub = topic.get_subscription_mut("sub-analytics").unwrap();
-            sub.pull_batch(None)
+            sub.pull_batch(None, "orders").batch
         };
         assert_eq!(analytics_msgs.len(), 1);
 
@@ -433,6 +577,39 @@ mod topic_tests {
             assert!(sub.contains_key(&msg_id));
         }
     }
+
+    #[test]
+    fn test_topic_fanout_with_partial_capacity() {
+        let mut topic = Topic::new("orders".to_string());
+
+        // Sub A: Unbounded (None)
+        topic.create_subscription("sub-unbounded", Duration::from_secs(10), Some(10), None, None);
+        // Sub B: Capped at 1 message
+        topic.create_subscription("sub-capped", Duration::from_secs(10), Some(10), Some(1), None);
+
+        let msg1 = dummy_msg("Order #1");
+        let msg2 = dummy_msg("Order #2");
+
+        // Publish 2 messages
+        topic.publish(msg1);
+        topic.publish(msg2);
+
+        // Sub A gets both messages
+        let sub_a = {
+            let s = topic.get_subscription_mut("sub-unbounded").unwrap();
+            (s.len(), s.dropped_messages)
+        };
+        assert_eq!(sub_a.0, 2);
+        assert_eq!(sub_a.1, 0);
+
+        // Sub B gets only 1 message, second is dropped
+        let sub_b = {
+            let s = topic.get_subscription_mut("sub-capped").unwrap();
+            (s.len(), s.dropped_messages)
+        };
+        assert_eq!(sub_b.0, 1);
+        assert_eq!(sub_b.1, 1);
+    }
 }
 
 #[cfg(test)]
@@ -441,6 +618,11 @@ mod engine_tests {
     use std::collections::HashMap;
     use std::sync::Arc;
     use std::thread;
+
+
+    fn dummy_msg(payload_str: &str) -> Message {
+        Message::new(payload_str.as_bytes().to_vec(), HashMap::new())
+    }
 
     #[test]
     fn test_engine_collision_and_not_found_errors() {
@@ -455,14 +637,14 @@ mod engine_tests {
 
         // Subscription under non-existent topic
         assert_eq!(
-            engine.create_subscription("missing-topic", "sub-1", Duration::from_secs(5), Some(5)).unwrap_err(),
+            engine.create_subscription("missing-topic", "sub-1", Duration::from_secs(5), Some(5), None, None, None).unwrap_err(),
             PubSubError::TopicNotFound("missing-topic".to_string())
         );
 
         // Duplicate subscription under existing topic
-        assert!(engine.create_subscription("payments", "sub-1", Duration::from_secs(5), Some(5)).is_ok());
+        assert!(engine.create_subscription("payments", "sub-1", Duration::from_secs(5), Some(5), None, None, None).is_ok());
         assert_eq!(
-            engine.create_subscription("payments", "sub-1", Duration::from_secs(5), Some(5)).unwrap_err(),
+            engine.create_subscription("payments", "sub-1", Duration::from_secs(5), Some(5), None, None, None).unwrap_err(),
             PubSubError::SubscriptionAlreadyExists("sub-1".to_string())
         );
 
@@ -481,7 +663,7 @@ mod engine_tests {
     fn test_concurrent_multithreaded_publish_and_pull() {
         let engine = Arc::new(Engine::new());
         engine.create_topic("events").unwrap();
-        engine.create_subscription("events", "sub-workers", Duration::from_secs(10), Some(10)).unwrap();
+        engine.create_subscription("events", "sub-workers", Duration::from_secs(10), Some(10), None, None, None).unwrap();
 
         let mut handles = vec![];
 
@@ -502,12 +684,10 @@ mod engine_tests {
         for _ in 0..5 {
             let engine_clone = Arc::clone(&engine);
             let handle = thread::spawn(move || {
-                let mut total_acked = 0;
                 for _ in 0..30 {
                     if let Ok(msgs) = engine_clone.pull_batch("events", "sub-workers", Some(5)) {
                         for m in msgs {
                             if engine_clone.ack("events", "sub-workers", &m.id).is_ok() {
-                                total_acked += 1;
                             }
                         }
                     }
@@ -527,5 +707,79 @@ mod engine_tests {
         for m in remaining {
             let _ = engine.ack("events", "sub-workers", &m.id);
         }
+    }
+
+    #[test]
+    fn test_dead_letter_topic_routing_and_attribute_enrichment() {
+        let engine = Engine::new();
+
+        // 1. Create main topic and dead-letter topic
+        engine.create_topic("orders").unwrap();
+        engine.create_topic("orders-dlt").unwrap();
+
+        // 2. Create DLT subscription to read evicted poison messages
+        engine
+            .create_subscription("orders-dlt", "dlt-sub", Duration::from_secs(10), None, None, None, None)
+            .unwrap();
+
+        // 3. Create main subscription with max 2 delivery attempts and DLT configured
+        let ack_deadline = Duration::from_millis(50);
+        engine
+            .create_subscription(
+                "orders",
+                "sub-payments",
+                ack_deadline,
+                Some(10),
+                None,
+                Some("orders-dlt".to_string()), // dead_letter_topic
+                Some(2),                      // max_delivery_attempts
+            )
+            .unwrap();
+
+        // 4. Publish message
+        let msg = dummy_msg("Poison Order #99");
+        let original_msg_id = msg.id.clone();
+        engine.publish("orders", msg).unwrap();
+
+        // Attempt 1: Pull message (delivery_attempt = 1)
+        let batch1 = engine.pull_batch("orders", "sub-payments", Some(1)).unwrap();
+        assert_eq!(batch1.len(), 1);
+        assert_eq!(batch1[0].delivery_attempt, 1);
+
+        // Wait for visibility timeout to expire
+        thread::sleep(Duration::from_millis(60));
+
+        // Attempt 2: Pull message again (delivery_attempt = 2)
+        let batch2 = engine.pull_batch("orders", "sub-payments", Some(1)).unwrap();
+        assert_eq!(batch2.len(), 1);
+        assert_eq!(batch2[0].delivery_attempt, 2);
+
+        // Wait for visibility timeout to expire again
+        thread::sleep(Duration::from_millis(60));
+
+        // Attempt 3: Threshold hit! Pulling now should evict poison msg to 'orders-dlt' and return empty
+        let batch3 = engine.pull_batch("orders", "sub-payments", Some(1)).unwrap();
+        assert!(batch3.is_empty(), "Poison message should be evicted, not returned to consumer");
+
+        // 5. Verify the poison message arrived in 'orders-dlt' via 'dlt-sub'
+        let dlt_batch = engine.pull_batch("orders-dlt", "dlt-sub", Some(1)).unwrap();
+        assert_eq!(dlt_batch.len(), 1);
+
+        let dlt_msg = &dlt_batch[0];
+        assert_eq!(dlt_msg.id, original_msg_id);
+
+        // Check injected DLT metadata attributes
+        assert_eq!(
+            dlt_msg.attributes.get("x-dead-letter-source-subscription").unwrap(),
+            "sub-payments"
+        );
+        assert_eq!(
+            dlt_msg.attributes.get("x-dead-letter-source-topic").unwrap(),
+            "orders"
+        );
+        assert_eq!(
+            dlt_msg.attributes.get("x-dead-letter-delivery-attempts").unwrap(),
+            "2"
+        );
     }
 }

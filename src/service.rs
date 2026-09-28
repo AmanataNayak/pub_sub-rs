@@ -77,8 +77,16 @@ impl PubSubService for MyPubSubService {
 
         let ack_deadline = std::time::Duration::from_secs(req.ack_deadline_secs);
         let batch_size: Option<usize> = req.batch_size.map(|b| b as usize);
+        let max_outstanding_messages: Option<usize> = req.max_outstanding_messages.map(|cap| cap as usize);
+
+        let (dead_letter_queue, max_delivery_attempts) = match req.dead_letter_policy {
+            Some(dlp) => (Some(dlp.dead_letter_queue), dlp.max_delivery_attempts),
+            None => (None, None)
+        };
+
+
         self.engine
-            .create_subscription(&req.topic, &req.subscription, ack_deadline, batch_size)
+            .create_subscription(&req.topic, &req.subscription, ack_deadline, batch_size, max_outstanding_messages, dead_letter_queue, max_delivery_attempts)
             .map_err(Status::from)?;
 
         Ok(Response::new(CreateSubscriptionResponse { success: true }))

@@ -5,6 +5,7 @@ use std::sync::Mutex;
 use crate::model::Message;
 use serde_json;
 use serde::{Deserialize, Serialize};
+use crate::engine::DeadLetterPolicy;
 
 #[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub enum WalEntry {
@@ -15,7 +16,14 @@ pub enum WalEntry {
         topic: String,
         subscription: String,
         ack_deadline_sec: u64,
-        batch_size: usize
+        #[serde(default)]
+        batch_size: Option<usize>,
+        #[serde(default)]
+        max_outstanding_messages: Option<usize>,
+        #[serde(default)]
+        dead_letter_queue: Option<String>,
+        #[serde(default)]
+        max_delivery_attempts: Option<u32>
     },
     Publish {
         topic: String,
@@ -90,7 +98,6 @@ impl WalManager {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::HashMap;
 
     #[test]
     fn test_wal_append_recover() {
@@ -99,7 +106,7 @@ mod tests {
         // Clean up any old test file
         match std::fs::remove_file(test_wal_path){
             Ok(()) => println!("Deleted successfully"),
-            Err(e) => println!("Not found")
+            Err(_) => println!("Not found")
         }
 
 
@@ -113,7 +120,10 @@ mod tests {
             topic: "orders".to_string(),
             subscription: "inv-sub".to_string(),
             ack_deadline_sec: 10,
-            batch_size: 1
+            batch_size: Some(1),
+            max_outstanding_messages: None,
+            dead_letter_queue: None,
+            max_delivery_attempts: None
         };
 
         // Append entries

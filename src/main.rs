@@ -1,3 +1,4 @@
+use std::cmp::max;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -15,6 +16,7 @@ mod model;
 mod service; // Contains your PubSubService struct implementing tonic gRPC handlers
 mod wal;
 mod errors;
+mod push;
 
 use engine::Engine;
 use service::MyPubSubService;
@@ -45,12 +47,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 subscription,
                 ack_deadline_sec,
                 batch_size,
+                max_outstanding_messages,
+                dead_letter_queue,
+                max_delivery_attempts
             } => {
                 let _ = engine.create_subscription(
                     &topic,
                     &subscription,
                     Duration::from_secs(ack_deadline_sec),
-                    Some(batch_size)
+                    batch_size,
+                    max_outstanding_messages,
+                    dead_letter_queue,
+                    max_delivery_attempts
                 );
             }
             WalEntry::Publish { topic, message } => {
