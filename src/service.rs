@@ -63,6 +63,27 @@ impl PubSubService for MyPubSubService {
 
         Ok(Response::new(CreateTopicResponse { success:true }))
     }
+    async fn create_push_subscription(&self, request: Request<CreatePushSubscriptionRequest>) -> Result<Response<CreateSubscriptionResponse>, Status> {
+        let req = request.into_inner();
+
+        if req.topic.is_empty() || req.subscription.is_empty() {
+            return Err(Status::invalid_argument("topic and subscription names are required"));
+        }
+
+        if req.ack_deadline_secs == 0 {
+            return Err(Status::invalid_argument("ack_deadline_secs must be greater than 0"));
+        }
+
+        let ack_deadline = std::time::Duration::from_secs(req.ack_deadline_secs);
+        let max_outstanding_messages: Option<usize> = req.max_outstanding_messages.map(|cap| cap as usize);
+        let (dead_letter_queue, max_delivery_attempts) = match req.dead_letter_policy {
+            Some(dlp) => (Some(dlp.dead_letter_queue), dlp.max_delivery_attempts),
+            None => (None, None)
+        };
+
+        let _ = self.engine.create_push_subscription(&req.topic, &req.subscription, &req.push_endpoint, req.headers, req.timeout_secs, ack_deadline, max_outstanding_messages, dead_letter_queue, max_delivery_attempts).map_err(Status::from)?;
+        Ok(Response::new(CreateSubscriptionResponse { success: true }))
+    }
 
     async fn create_subscription(&self, request: Request<CreateSubscriptionRequest>) -> Result<Response<CreateSubscriptionResponse>, Status> {
         let req = request.into_inner();
