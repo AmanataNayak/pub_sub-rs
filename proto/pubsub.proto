@@ -5,6 +5,7 @@ package pubsub;
 service PubSubService {
   rpc CreateTopic (CreateTopicRequest) returns (CreateTopicResponse);
   rpc CreateSubscription (CreateSubscriptionRequest) returns (CreateSubscriptionResponse);
+  rpc CreatePushSubscription (CreatePushSubscriptionRequest) returns (CreateSubscriptionResponse);
   rpc Publish (PublishRequest) returns (PublishResponse);
 
   // Bidirectional streaming endpoint for real-time push delivery & inline Acks
@@ -36,6 +37,18 @@ message CreateSubscriptionRequest {
 
 message CreateSubscriptionResponse {
   bool success = 1;
+}
+
+
+message CreatePushSubscriptionRequest {
+  string topic = 1;
+  string subscription = 2;
+  uint64 ack_deadline_secs = 3;
+  string push_endpoint = 4;
+  map<string, string> headers = 5;
+  optional uint64 timeout_secs = 6;
+  optional uint32 max_outstanding_messages = 7;
+  optional DeadLetterPolicy dead_letter_policy = 8;
 }
 
 message PublishRequest {
