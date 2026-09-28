@@ -44,3 +44,15 @@ pub enum DeliveryState {
         deadline: Instant
     }
 }
+
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeadLetterPolicy {
+    pub dead_letter_queue: String,
+    pub max_delivery_attempts: u32,
+}
+
+pub struct PullRequest {
+    pub batch: Vec<Message>,
+    pub poison_messages: Vec<Message>
+}

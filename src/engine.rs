@@ -8,20 +8,11 @@ use std::time::{
 use std::sync::{Arc, RwLock};
 use serde::{Deserialize, Serialize};
 use tokio::sync::Notify;
-use crate::model::{DeliveryState, Message};
+use crate::model::{DeliveryState, Message, DeadLetterPolicy, PullRequest};
 use crate::errors::{PubSubError};
 use crate::wal::{WalEntry, WalManager};
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct DeadLetterPolicy {
-    pub dead_letter_queue: String,
-    pub max_delivery_attempts: u32,
-}
 
-pub struct PullRequest {
-    pub batch: Vec<Message>,
-    pub poison_messages: Vec<Message>
-}
 
 pub struct Subscription {
     pub name: String,

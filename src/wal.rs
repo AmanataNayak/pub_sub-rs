@@ -2,10 +2,9 @@ use std::io::{BufRead, Write};
 use std::path::Path;
 use std::fs::{File, OpenOptions};
 use std::sync::Mutex;
-use crate::model::Message;
+use crate::model::{Message};
 use serde_json;
 use serde::{Deserialize, Serialize};
-use crate::engine::DeadLetterPolicy;
 
 #[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub enum WalEntry {
