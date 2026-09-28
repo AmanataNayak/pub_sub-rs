@@ -44,11 +44,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 topic,
                 subscription,
                 ack_deadline_sec,
+                batch_size,
             } => {
                 let _ = engine.create_subscription(
                     &topic,
                     &subscription,
                     Duration::from_secs(ack_deadline_sec),
+                    Some(batch_size)
                 );
             }
             WalEntry::Publish { topic, message } => {

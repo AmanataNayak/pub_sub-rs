@@ -14,7 +14,8 @@ pub enum WalEntry {
     CreateSubscription {
         topic: String,
         subscription: String,
-        ack_deadline_sec: u64
+        ack_deadline_sec: u64,
+        batch_size: usize
     },
     Publish {
         topic: String,
@@ -112,6 +113,7 @@ mod tests {
             topic: "orders".to_string(),
             subscription: "inv-sub".to_string(),
             ack_deadline_sec: 10,
+            batch_size: 1
         };
 
         // Append entries

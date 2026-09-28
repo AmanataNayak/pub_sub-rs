@@ -3,6 +3,7 @@ use std::collections::HashMap;
 use std::time::Instant;
 use uuid::Uuid;
 
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Message {
     pub id: String,
@@ -21,6 +22,18 @@ impl Message {
         }
     }
 }
+
+impl From<Message> for crate::pubsub::Message {
+    fn from(msg: Message) -> Self {
+        Self {
+            id: msg.id,
+            payload: msg.payload,
+            attributes: msg.attributes,
+            delivery_attempt: msg.delivery_attempt
+        }
+    }
+}
+
 
 #[derive(Debug, Clone)]
 pub enum DeliveryState {

@@ -23,6 +23,7 @@ message CreateSubscriptionRequest {
   string topic = 1;
   string subscription = 2;
   uint64 ack_deadline_secs = 3;
+  optional uint32 batch_size = 4;
 }
 
 message CreateSubscriptionResponse {
@@ -53,6 +54,7 @@ message StreamingPullRequest {
 
   // Subsequent streaming requests send ack IDs to retire
   repeated string ack_ids = 3;
+  optional uint32 max_messages = 4;
 }
 
 // Server pushes messages directly over the outgoing stream

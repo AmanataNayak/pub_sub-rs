@@ -76,9 +76,9 @@ impl PubSubService for MyPubSubService {
         }
 
         let ack_deadline = std::time::Duration::from_secs(req.ack_deadline_secs);
-
+        let batch_size: Option<usize> = req.batch_size.map(|b| b as usize);
         self.engine
-            .create_subscription(&req.topic, &req.subscription, ack_deadline)
+            .create_subscription(&req.topic, &req.subscription, ack_deadline, batch_size)
             .map_err(Status::from)?;
 
         Ok(Response::new(CreateSubscriptionResponse { success: true }))
@@ -113,6 +113,11 @@ impl PubSubService for MyPubSubService {
         let topic_name = first_req.topic_name;
         let sub_name = first_req.subscription_name;
 
+        let mut max_request: Option<usize> = match first_req.max_messages {
+            Some(m) if m > 0 => Some(m as usize),
+            _ => None
+        };
+
         if topic_name.is_empty() || sub_name.is_empty() {
             return Err(Status::invalid_argument("Initial request must specify topic_name and subscription_name"));
         }
@@ -137,32 +142,29 @@ impl PubSubService for MyPubSubService {
 
             loop {
                 // Drain any available messages from the subscription and push to gRPC stream
-                while let Ok(Some(msg)) = engine.pull(&topic_name, &sub_name) {
-                    let pb_msg = crate::pubsub::Message {
-                        id: msg.id,
-                        payload: msg.payload,
-                        attributes: msg.attributes,
-                        delivery_attempt: msg.delivery_attempt
+                let messages = engine.pull_batch(&topic_name, &sub_name, max_request).unwrap();
+                if !messages.is_empty() {
+                    let responses = StreamingPullResponse {
+                        messages: messages.into_iter().map(Into::into).collect(),
                     };
 
-                    let response = StreamingPullResponse {
-                        messages: vec![pb_msg],
-                    };
-
-                    if tx.send(Ok(response)).await.is_err() {
+                    if tx.send(Ok(responses)).await.is_err() {
                         // Client disconnected, terminate background loop
                         return;
                     }
                 }
-
                 // Wait for either client incoming Acks, engine notifications, or timer ticks
                 tokio::select! {
                     // Branch A: Incoming Ack request from subscriber
-                    maybe_req = req_stream.next() => {
-                        match maybe_req {
+                    incoming = req_stream.next() => {
+                        match incoming {
                             Some(Ok(req)) => {
                                 for ack_id in req.ack_ids {
                                     let _ = engine.ack(&topic_name, &sub_name, &ack_id);
+                                }
+
+                                if let Some(new_max) = req.max_messages.filter(|&m| m > 0) {
+                                    max_request = Some(new_max as usize)
                                 }
                             },
                             _ => return, // Stream closed or errored, exist loop
