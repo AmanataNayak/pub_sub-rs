@@ -13,14 +13,14 @@ use pubsub::pub_sub_service_server::PubSubServiceServer;
 
 mod engine;
 mod model;
-mod service; // Contains your PubSubService struct implementing tonic gRPC handlers
-mod wal;
+mod server; // Contains your PubSubService struct implementing tonic gRPC handlers
+mod storage;
 mod errors;
-mod push;
+mod workers;
 
 use engine::Engine;
-use service::MyPubSubService;
-use wal::{WalEntry, WalManager};
+use server::MyPubSubService;
+use storage::{WalEntry, WalManager};
 
 
 #[tokio::main]
