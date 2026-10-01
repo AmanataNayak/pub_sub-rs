@@ -17,6 +17,7 @@ futures = "0.3.34"
 tonic = "0.12"
 prost = "0.13"
 reqwest = "0.12"
+bytes = { version = "1.10", features = ["serde"] }
 
 [build-dependencies]
 tonic-build = "0.12"

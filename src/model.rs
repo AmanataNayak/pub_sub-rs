@@ -1,19 +1,19 @@
 use serde::{Serialize, Deserialize};
 use std::collections::HashMap;
-use std::time::Instant;
+use bytes::Bytes;
 use uuid::Uuid;
 
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Message {
     pub id: String,
-    pub payload: Vec<u8>,
+    pub payload: Bytes,
     pub attributes: HashMap<String, String>,
     pub delivery_attempt: u32
 }
 
 impl Message {
-    pub fn new(payload: Vec<u8>, attributes: HashMap<String, String>) -> Self {
+    pub fn new(payload: Bytes, attributes: HashMap<String, String>) -> Self {
         Self {
             id: Uuid::new_v4().to_string(),
             payload,

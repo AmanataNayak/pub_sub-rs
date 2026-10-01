@@ -1,8 +1,7 @@
-use tokio::sync::mpsc::Receiver;
 use std::time::Duration;
 use reqwest::Client;
 use crate::engine::Engine;
-use crate::model::{Message, PushConfig};
+use crate::model::{PushConfig};
 use tokio::time::interval;
 use tokio::sync::Notify;
 use std::sync::Arc;
@@ -51,7 +50,7 @@ pub fn spawn_push_workers(topic_name: String, sub_name: String, push_config: Pus
 mod push_worker_tests {
     use super::*;
     use std::collections::HashMap;
-    use std::sync::Arc;
+    use crate::model::Message;
     use std::time::Duration;
     use tokio::io::{AsyncReadExt, AsyncWriteExt}; // Trait imports required for socket.read/write
     use tokio::net::TcpListener;
@@ -124,7 +123,7 @@ mod push_worker_tests {
                 "worker-topic",
                 Message {
                     id: "msg-worker-101".to_string(),
-                    payload: b"Direct Worker Payload".to_vec(),
+                    payload:bytes::Bytes::from(b"Direct Worker Payload".to_vec()),
                     attributes: HashMap::new(),
                     delivery_attempt: 0,
                 },
@@ -215,7 +214,7 @@ mod push_worker_tests {
                 "fail-topic",
                 Message {
                     id: "msg-fail-001".to_string(),
-                    payload: b"Failing Payload".to_vec(),
+                    payload:bytes::Bytes::from(b"Failing Payload".to_vec()),
                     attributes: HashMap::new(),
                     delivery_attempt: 0,
                 },

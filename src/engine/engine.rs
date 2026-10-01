@@ -1,12 +1,9 @@
-use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 use tokio::sync::Notify;
 
 pub use crate::engine::topic::Topic;
-pub use crate::engine::subscription::Subscription;
-
 use crate::errors::PubSubError;
 use crate::model::{DeadLetterPolicy, Message, PushConfig};
 use crate::workers::spawn_push_workers;
@@ -163,7 +160,7 @@ impl Engine {
         }
 
         let notify = {
-            let mut topic_arc = self.get_topic(topic_name)?;
+            let topic_arc = self.get_topic(topic_name)?;
             let mut topic = topic_arc.write().unwrap();
 
             if topic.subscription.contains_key(sub_name) {
@@ -301,11 +298,12 @@ mod engine_tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
     use tokio::sync::mpsc;
+    use crate::engine::subscription::Subscription;
     use std::thread::sleep;
 
 
     fn dummy_msg(payload_str: &str) -> Message {
-        Message::new(payload_str.as_bytes().to_vec(), HashMap::new())
+        Message::new(bytes::Bytes::from(payload_str.as_bytes().to_vec()), HashMap::new())
     }
 
     #[test]
@@ -357,7 +355,7 @@ mod engine_tests {
             let handle = thread::spawn(move || {
                 for i in 0..20 {
                     let payload = format!("producer-{t_id}-msg-{i}").into_bytes();
-                    let msg = Message::new(payload, HashMap::new());
+                    let msg = Message::new(bytes::Bytes::from(payload), HashMap::new());
                     engine_clone.publish("events", msg).unwrap();
                 }
             });
@@ -518,7 +516,7 @@ mod engine_tests {
                 "orders",
                 Message {
                     id: "msg-push-001".to_string(),
-                    payload: msg_payload,
+                    payload: bytes::Bytes::from(msg_payload),
                     attributes: HashMap::new(),
                     delivery_attempt: 0,
                 },

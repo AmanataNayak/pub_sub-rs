@@ -78,7 +78,7 @@ mod topic_tests {
     use std::collections::HashMap;
 
     fn dummy_msg(payload_str: &str) -> Message {
-        Message::new(payload_str.as_bytes().to_vec(), HashMap::new())
+        Message::new(bytes::Bytes::from(payload_str.as_bytes().to_vec()), HashMap::new())
     }
 
 

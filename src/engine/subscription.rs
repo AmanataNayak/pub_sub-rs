@@ -1,4 +1,3 @@
-use std::cmp::max;
 use std::collections::{HashMap, VecDeque};
 use std::time::{
     Duration,
@@ -102,7 +101,7 @@ impl Subscription {
                 None => break // queue is empty
             };
 
-            if let Some(mut msg) = self.messages.get_mut(&msg_id) {
+            if let Some(msg) = self.messages.get_mut(&msg_id) {
                 // mark message as in-flight with its visibility deadline
                 msg.delivery_attempt += 1;
                 self.in_flight.insert(msg_id, expiration);
