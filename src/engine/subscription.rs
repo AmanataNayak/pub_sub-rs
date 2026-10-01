@@ -77,7 +77,7 @@ impl Subscription {
             },
             _ => {
                 let msg_id = msg.id.clone();
-                self.messages.insert(msg_id.clone(), (msg));
+                self.messages.insert(msg_id.clone(), msg);
                 self.ready_queue.push_back(msg_id);
                 self.notify.notify_waiters();
                 true
@@ -115,9 +115,15 @@ impl Subscription {
     }
 
     /// Remove the message in case of acknowledgment
-    pub fn ack(&mut self, message_id: &str) -> bool{
-        self.in_flight.remove(message_id);
-        self.messages.remove(message_id).is_some()
+    pub fn ack_batch(&mut self, message_ids: &[String]) -> usize{
+        let mut success_count = 0;
+        for message_id in message_ids {
+            self.in_flight.remove(message_id);
+            if self.messages.remove(message_id).is_some() {
+                success_count += 1;
+            }
+        }
+        success_count
     }
 
     pub fn contains_key(&self, message_id: &str) -> bool {
@@ -260,17 +266,19 @@ mod subscription_tests {
         sub.push(msg);
 
         // case 1: ACK non-existent ID
-        assert!(!sub.ack("non-existent-uuid"));
+        assert_eq!(sub.ack_batch(&["non-existent-uuid".to_string()]), 0);
 
         // Pull the message to move it to InFlight
         let pulled = sub.pull_batch(None);
         assert_eq!(pulled.len(), 1);
 
         // case 2: First ACK succeeds
-        assert!(sub.ack(&msg_id));
+        let arr = [msg_id.to_string()];
+        assert_eq!(sub.ack_batch(&arr), 1);
 
+        let arr = [msg_id.to_string()];
         // case 3: Second ACK on same ID fails (already removed)
-        assert!(!sub.ack(&msg_id));
+        assert_eq!(sub.ack_batch(&arr), 0);
     }
 
     #[test]
@@ -329,7 +337,7 @@ mod subscription_tests {
         let batch = sub.pull_batch(Some(1));
         assert_eq!(batch.len(), 1);
         let msg_id = batch[0].id.clone();
-        assert!(sub.ack(&msg_id));
+        assert_eq!(sub.ack_batch(&[msg_id]), 1);
         assert_eq!(sub.len(), 1);
 
         // Push 4: Space is freed, should succeed now
@@ -383,8 +391,8 @@ mod subscription_tests {
         assert_eq!(pulled.len(), 1);
 
         // ACK message
-        let ack_success = sub.ack("m1");
-        assert!(ack_success);
+        let ack_success = sub.ack_batch(&["m1".to_string()]);
+        assert_eq!(ack_success, 1);
 
         // Pulling again should yield nothing
         let pulled_again = sub.pull_batch(Some(1));
@@ -395,7 +403,7 @@ mod subscription_tests {
     fn test_skips_stale_or_missing_ids_in_ready_queue() {
         let mut sub = Subscription::new(
             "sub-stale".to_string(),
-            Duration::from_secs(10),
+            Duration::from_millis(10),
             100,
             None,
             None,
@@ -405,8 +413,10 @@ mod subscription_tests {
         sub.push(create_msg("m2"));
 
         // Simulate out-of-band deletion or ACK before pull (stale ID in ready_queue)
-        sub.ack("m1");
-
+        sub.pull_batch(Some(2));
+        sub.ack_batch(&["m1".to_string()]);
+        sleep(Duration::from_millis(10));
+        sub.requeue_expired();
         // Pull should skip missing 'm1' silently and return 'm2'
         let batch = sub.pull_batch(Some(2));
         assert_eq!(batch.len(), 1);

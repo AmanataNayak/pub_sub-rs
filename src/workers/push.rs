@@ -33,7 +33,7 @@ pub fn spawn_push_workers(topic_name: String, sub_name: String, push_config: Pus
 
                     if let Ok(resp) = req.send().await {
                         if resp.status().is_success() {
-                            let _ = engine.ack(&topic_name, &sub_name, &msg.id);
+                            let _ = engine.ack_batch(&topic_name, &sub_name, &[msg.id]);
                         }
                     }
                 }
@@ -233,7 +233,7 @@ mod push_worker_tests {
         // 7. Verify message is STILL present in engine memory
 
         engine.process_expired_messages();
-        
+
         let pending = engine
             .pull_batch("fail-topic", "fail-sub", Some(1))
             .unwrap();

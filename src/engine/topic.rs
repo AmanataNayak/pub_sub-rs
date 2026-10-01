@@ -117,7 +117,8 @@ mod topic_tests {
         // Acking on sub-billing remove it from sub-billing ONLY
         {
             let billing_sub = topic.get_subscription_mut("sub-billing").unwrap();
-            assert!(billing_sub.ack(&msg_id));
+            let arr = &[msg_id.clone()];
+            assert_eq!(billing_sub.ack_batch(arr), 1);
             assert!(!billing_sub.contains_key(&msg_id));
         }
         {

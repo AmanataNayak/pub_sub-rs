@@ -35,7 +35,7 @@ pub enum WalEntry {
     Ack {
         topic: String,
         subscription: String,
-        message_id: String
+        message_ids: Vec<String>
     }
 }
 

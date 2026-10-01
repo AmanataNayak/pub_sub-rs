@@ -226,32 +226,28 @@ impl Engine {
     }
 
     /// Acknowledges a message on a subscription
-    pub fn ack(&self, topic_name: &str, sub_name: &str, message_id: &str) -> Result<(), PubSubError> {
+    pub fn ack_batch(&self, topic_name: &str, sub_name: &str, message_ids: &[String]) -> Result<usize, PubSubError> {
+        if message_ids.is_empty() {
+            return Ok(0);
+        }
         let topic_arc = self.get_topic(topic_name)?;
-
         let mut topic = topic_arc.write().unwrap();
-
         let sub = topic.get_subscription_mut(sub_name).ok_or_else(|| PubSubError::SubscriptionNotFound(sub_name.to_string()))?;
 
-        if !sub.contains_key(message_id) { // (Or check sub.messages.contains_key)
-            return Err(PubSubError::MessageNotFound(message_id.to_string()));
-        }
 
         // 2. WRITE TO WAL
         if let Some(wal) = &self.wal {
             let entry = WalEntry::Ack {
                 topic: topic_name.to_string(),
                 subscription: sub_name.to_string(),
-                message_id: message_id.to_string(),
+                message_ids: message_ids.to_vec(),
             };
             wal.append(&entry)
                 .map_err(|e| PubSubError::IoError(e.to_string()))?;
         }
 
         // 3. MUTATE IN-MEMORY STATE
-        sub.ack(message_id);
-        Ok(())
-
+        Ok(sub.ack_batch(message_ids))
     }
 
     pub fn get_subscription_notify(&self, topic_name: &str, sub_name: &str) -> Result<Arc<Notify>, PubSubError> {
@@ -375,7 +371,7 @@ mod engine_tests {
                 for _ in 0..30 {
                     if let Ok(msgs) = engine_clone.pull_batch("events", "sub-workers", Some(5)) {
                         for m in msgs {
-                            if engine_clone.ack("events", "sub-workers", &m.id).is_ok() {}
+                            if engine_clone.ack_batch("events", "sub-workers", &[m.id]).is_ok() {}
                         }
                     }
                     thread::sleep(Duration::from_millis(1));
@@ -392,7 +388,7 @@ mod engine_tests {
         // Final pull to clear any remaining queued messages
         let remaining = engine.pull_batch("events", "sub-workers", Some(100)).unwrap();
         for m in remaining {
-            let _ = engine.ack("events", "sub-workers", &m.id);
+            let _ = engine.ack_batch("events", "sub-workers", &[m.id]);
         }
     }
 
@@ -663,5 +659,62 @@ mod engine_tests {
         assert_eq!(repulled.len(), 1);
         assert_eq!(repulled[0].id, msg_id);
         assert_eq!(repulled[0].delivery_attempt, 2);
+    }
+
+    #[test]
+    fn test_subscription_ack_batch_removes_inflight_and_storage() {
+        let mut sub = Subscription::new(
+            "sub-batch-ack".to_string(),
+            Duration::from_secs(10),
+            10,
+            None,
+            None,
+        );
+
+        sub.push(dummy_msg("msg-1"));
+        sub.push(dummy_msg("msg-2"));
+        sub.push(dummy_msg("msg-3"));
+
+        // Pull 3 messages into InFlight
+        let pulled = sub.pull_batch(Some(3));
+        assert_eq!(pulled.len(), 3);
+
+        let ids: Vec<String> = pulled.iter().map(|m| m.id.clone()).collect();
+
+        // Batch ACK all 3 messages in a single call
+        let acked_count = sub.ack_batch(&ids);
+        assert_eq!(acked_count, 3);
+
+        // Verify storage is empty and pulling returns nothing
+        assert_eq!(sub.len(), 0);
+        assert!(sub.pull_batch(Some(10)).is_empty());
+    }
+
+    #[test]
+    fn test_subscription_ack_batch_handles_partial_and_invalid_ids() {
+        let mut sub = Subscription::new(
+            "sub-partial-ack".to_string(),
+            Duration::from_secs(10),
+            10,
+            None,
+            None,
+        );
+
+        sub.push(dummy_msg("valid-1"));
+        sub.push(dummy_msg("valid-2"));
+
+        let pulled = sub.pull_batch(Some(2));
+        let mut ids: Vec<String> = pulled.iter().map(|m| m.id.clone()).collect();
+
+        // Inject non-existent ID into the batch
+        ids.push("ghost-id-999".to_string());
+
+        // Batch ACK should succeed for 2 valid messages and ignore the missing ID
+        let acked_count = sub.ack_batch(&ids);
+        assert_eq!(acked_count, 2);
+
+        // Re-ACKing the same batch should return 0 (already removed)
+        let re_ack_count = sub.ack_batch(&ids);
+        assert_eq!(re_ack_count, 0);
     }
 }

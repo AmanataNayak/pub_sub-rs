@@ -107,9 +107,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             WalEntry::Ack {
                 topic,
                 subscription,
-                message_id,
+                message_ids,
             } => {
-                let _ = engine.ack(&topic, &subscription, &message_id);
+                let _ = engine.ack_batch(&topic, &subscription, &message_ids);
             }
         }
     }
