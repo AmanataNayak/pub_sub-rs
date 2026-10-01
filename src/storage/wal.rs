@@ -36,6 +36,11 @@ pub enum WalEntry {
         topic: String,
         subscription: String,
         message_ids: Vec<String>
+    },
+    Nack {
+        topic: String,
+        subscription: String,
+        message_ids: Vec<String>
     }
 }
 

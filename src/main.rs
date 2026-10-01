@@ -110,6 +110,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             } => {
                 let _ = engine.ack_batch(&topic, &subscription, &message_ids);
             }
+            WalEntry::Nack {
+                topic,
+                subscription,
+                message_ids
+            } => {
+                let _ = engine.nack_batch(&topic, &subscription, &message_ids);
+            }
         }
     }
 

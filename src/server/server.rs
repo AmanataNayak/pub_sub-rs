@@ -163,7 +163,9 @@ impl PubSubService for MyPubSubService {
         // for ack_id in first_req.ack_ids {
         // }
         let ack_ids = first_req.ack_ids;
+        let nack_ids = first_req.nack_ids;
         let _ = engine.ack_batch(&topic_name, &sub_name, &ack_ids);
+        let _ = engine.nack_batch(&topic_name, &sub_name, &nack_ids);
 
         // Spawn active worker loop for this streaming connection
         tokio::spawn(async  move {
@@ -190,7 +192,7 @@ impl PubSubService for MyPubSubService {
                         match incoming {
                             Some(Ok(req)) => {
                                 let _ = engine.ack_batch(&topic_name, &sub_name, &req.ack_ids);
-
+                                let _ = engine.nack_batch(&topic_name, &sub_name, &req.nack_ids);
                                 if let Some(new_max) = req.max_messages.filter(|&m| m > 0) {
                                     max_request = Some(new_max as usize)
                                 }

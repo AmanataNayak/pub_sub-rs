@@ -75,7 +75,8 @@ message StreamingPullRequest {
 
   // Subsequent streaming requests send ack IDs to retire
   repeated string ack_ids = 3;
-  optional uint32 max_messages = 4;
+  repeated string nack_ids = 4;
+  optional uint32 max_messages = 5;
 }
 
 // Server pushes messages directly over the outgoing stream

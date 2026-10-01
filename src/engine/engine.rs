@@ -286,6 +286,40 @@ impl Engine {
             }
         }
     }
+
+    /// nack to delete failed message and pushed to dlq(if available)
+    pub fn nack_batch(&self, topic_name: &str, sub_name: &str, message_ids: &[String]) -> Result<usize, PubSubError> {
+        let mut dead_letters = Vec::new();
+        {
+            let topic_arc = self.get_topic(topic_name)?;
+
+            let mut topic = topic_arc.write().unwrap();
+
+            let mut sub = topic.get_subscription_mut(sub_name)
+                .ok_or_else(|| PubSubError::SubscriptionNotFound(sub_name.to_string()))?;
+
+            if let Some(wal) = &self.wal {
+                let entry = WalEntry::Nack {
+                    topic: topic_name.to_string(),
+                    subscription: sub_name.to_string(),
+                    message_ids: message_ids.to_vec(),
+                };
+                wal.append(&entry)
+                    .map_err(|e| PubSubError::IoError(e.to_string()))?;
+            }
+
+            let evicted = sub.nack_batch(message_ids);
+            dead_letters.extend(evicted);
+        }
+
+        let mut nack_count = 0;
+        for (dlq, msg) in dead_letters {
+            self.publish(&dlq, msg);
+            nack_count += 1;
+        }
+
+        Ok(nack_count)
+    }
 }
 
 
@@ -714,5 +748,60 @@ mod engine_tests {
         // Re-ACKing the same batch should return 0 (already removed)
         let re_ack_count = sub.ack_batch(&ids);
         assert_eq!(re_ack_count, 0);
+    }
+
+    #[test]
+    fn test_engine_nack_routes_poison_message_to_dlq() {
+        let engine = Engine::new();
+
+        let main_topic = "orders";
+        let dlq_topic = "orders-dlq";
+
+        engine.create_topic(main_topic).unwrap();
+        engine.create_topic(dlq_topic).unwrap();
+
+        // Create DLT listener subscription
+        engine
+            .create_subscription(dlq_topic, "sub-dlq-audit", Duration::from_secs(10), Some(10), None, None, None)
+            .unwrap();
+
+        // Create main subscription with DLQ enabled
+        engine
+            .create_subscription(
+                main_topic,
+                "sub-orders-proc",
+                Duration::from_secs(10),
+                Some(10),
+                None,
+                Some(dlq_topic.to_string()),
+                Some(3),
+            )
+            .unwrap();
+
+        // Publish and pull
+        let msg = dummy_msg("order-corrupted");
+        let msg_id = msg.id.clone();
+        engine.publish(main_topic, msg).unwrap();
+        let batch = engine.pull_batch(main_topic, "sub-orders-proc", Some(1)).unwrap();
+        assert_eq!(batch.len(), 1);
+
+        // NACK through Engine
+        let nacked_count = engine
+            .nack_batch(main_topic, "sub-orders-proc", &[batch[0].id.clone()])
+            .unwrap();
+        assert_eq!(nacked_count, 1);
+
+        // Main subscription should be empty
+        let main_pull = engine.pull_batch(main_topic, "sub-orders-proc", Some(1)).unwrap();
+        assert!(main_pull.is_empty());
+
+        // DLQ subscription should receive the nacked message
+        let dlq_pull = engine.pull_batch(dlq_topic, "sub-dlq-audit", Some(1)).unwrap();
+        assert_eq!(dlq_pull.len(), 1);
+        assert_eq!(dlq_pull[0].id, msg_id);
+        assert_eq!(
+            dlq_pull[0].attributes.get("x-dead-letter-source-subscription").map(|s| s.as_str()),
+            Some("sub-orders-proc")
+        );
     }
 }

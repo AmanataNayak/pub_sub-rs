@@ -195,6 +195,37 @@ impl Subscription {
 
         dead_letter_messages
     }
+
+    // nack(negative acknowledgment),
+    pub fn nack_batch(&mut self, message_ids: &[String]) -> Vec<(String, Message)> {
+        let mut dead_letter_messages = Vec::new();
+
+        for message_id in message_ids {
+            self.in_flight.remove(message_id);
+
+            if let Some(mut msg) = self.messages.remove(message_id) {
+                if let Some(policy) = &self.dead_letter_policy {
+                    msg.attributes.insert(
+                        "x-dead-letter-source-subscription".to_string(),
+                        self.name.clone()
+                    );
+
+                    msg.attributes.insert(
+                        "x-dead-letter-delivery-attempts".to_string(),
+                        msg.delivery_attempt.to_string()
+                    );
+
+                    msg.attributes.insert(
+                        "x-dead-letter-original-message-id".to_string(),
+                        msg.id.clone()
+                    );
+
+                    dead_letter_messages.push((policy.dead_letter_queue.clone(), msg));
+                }
+            }
+        }
+        dead_letter_messages
+    }
 }
 
 #[cfg(test)]
@@ -206,7 +237,7 @@ mod subscription_tests {
 
     fn dummy_msg(payload_str: &str) -> Message {
         Message {
-            id: uuid::Uuid::new_v4().to_string(),
+            id: payload_str.to_string(),
             payload: payload_str.as_bytes().to_vec().into(),
             attributes: HashMap::new(),
             delivery_attempt: 0,
@@ -446,5 +477,75 @@ mod subscription_tests {
         let requeued_batch = sub.pull_batch(Some(1));
         assert_eq!(requeued_batch.len(), 1);
         assert_eq!(requeued_batch[0].id, "m1");
+    }
+
+    #[test]
+    fn test_subscription_nack_without_dlq_purges_message() {
+        let mut sub = Subscription::new(
+            "sub-nack-nodlq".to_string(),
+            Duration::from_secs(10),
+            10,
+            None,
+            None,
+        );
+
+        sub.push(dummy_msg("msg-1"));
+        sub.push(dummy_msg("msg-2"));
+
+        let pulled = sub.pull_batch(Some(2));
+        assert_eq!(pulled.len(), 2);
+
+        // NACK without DLQ policy should delete the messages permanently
+        let evicted = sub.nack_batch(&["msg-1".to_string()]);
+        assert!(evicted.is_empty(), "No messages should be routed when DLQ is not configured");
+
+        // msg-1 is gone, sub length is now 1 (only msg-2 remains in_flight)
+        assert_eq!(sub.len(), 1);
+
+        // ACK msg-2 and ensure queue is empty
+        assert_eq!(sub.ack_batch(&["msg-2".to_string()]), 1);
+        assert_eq!(sub.len(), 0);
+    }
+
+    #[test]
+    fn test_subscription_nack_with_dlq_evicts_to_dlq_topic() {
+        let dlq_policy = DeadLetterPolicy {
+            dead_letter_queue: "dlq-orders".to_string(),
+            max_delivery_attempts: 5,
+        };
+
+        let mut sub = Subscription::new(
+            "sub-nack-dlq".to_string(),
+            Duration::from_secs(10),
+            10,
+            Some(5),
+            Some(dlq_policy)
+        );
+
+        sub.push(dummy_msg("poison-msg-101"));
+
+        let pulled = sub.pull_batch(Some(1));
+        assert_eq!(pulled.len(), 1);
+
+        // NACK message with DLQ policy configured
+        let evicted = sub.nack_batch(&["poison-msg-101".to_string()]);
+        assert_eq!(evicted.len(), 1);
+
+        let (dlq_target, msg) = &evicted[0];
+        assert_eq!(dlq_target, "dlq-orders");
+        assert_eq!(msg.id, "poison-msg-101");
+
+        // Check enriched metadata attributes
+        assert_eq!(
+            msg.attributes.get("x-dead-letter-source-subscription").map(|s| s.as_str()),
+            Some("sub-nack-dlq")
+        );
+        assert_eq!(
+            msg.attributes.get("x-dead-letter-original-message-id").map(|s| s.as_str()),
+            Some("poison-msg-101")
+        );
+
+        // Ensure subscription state is completely cleared
+        assert_eq!(sub.len(), 0);
     }
 }
