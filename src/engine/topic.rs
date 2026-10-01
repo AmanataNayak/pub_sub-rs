@@ -104,13 +104,13 @@ mod topic_tests {
         // Both subscriptions must receive their own copy
         let billing_msgs = {
             let sub = topic.get_subscription_mut("sub-billing").unwrap();
-            sub.pull_batch(None, "orders").batch
+            sub.pull_batch(None)
         };
         assert_eq!(billing_msgs.len(), 1);
 
         let analytics_msgs = {
             let sub = topic.get_subscription_mut("sub-analytics").unwrap();
-            sub.pull_batch(None, "orders").batch
+            sub.pull_batch(None)
         };
         assert_eq!(analytics_msgs.len(), 1);
 

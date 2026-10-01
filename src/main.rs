@@ -2,6 +2,8 @@ use std::cmp::max;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::time;
+use tokio::time::MissedTickBehavior;
 use tonic::transport::Server;
 
 // Include tonic generated protobuf module
@@ -23,6 +25,25 @@ use server::MyPubSubService;
 use storage::{WalEntry, WalManager};
 
 
+pub fn start_background_worker(engine: Arc<Engine>) {
+    tokio::spawn(async move {
+       let mut interval = time::interval(Duration::from_millis(50));
+
+        interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
+
+        loop {
+            interval.tick().await;
+
+            let engine_ref = Arc::clone(&engine);
+            // Offload CPU/blocking lock operations off Tokio worker threads
+            let _ = tokio::task::spawn_blocking(move || {
+                engine_ref.process_expired_messages();
+            }).await;
+        }
+    });
+}
+
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let wal_path = "pubsub.wal";
@@ -31,7 +52,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let wal = Arc::new(WalManager::open(wal_path)?);
 
     // 2. Create Engine initialized with WAL
-    let engine = Engine::with_wal(wal);
+    let engine =Arc::new(Engine::with_wal(wal));
 
     // 3. Recover entries directly into the active engine instance
     let recovered_entries = WalManager::recover(wal_path)?;
@@ -61,7 +82,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         &topic,
                         &subscription,
                         &pe,
-                        headers.unwrap(),
+                        headers.unwrap_or_default(),
                         timeout_secs,
                         ack_deadline,
                         max_outstanding_messages,
@@ -93,8 +114,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
+    // 4. Start the background worker
+    start_background_worker(Arc::clone(&engine));
+
     // 4. Instantiate gRPC Service wrapper
-    let pubsub_service = MyPubSubService::new(Arc::new(engine));
+    let pubsub_service = MyPubSubService::new(Arc::clone(&engine));
 
     // 5. Bind gRPC server to 0.0.0.0:50051
     let addr: SocketAddr = "0.0.0.0:50051".parse()?;

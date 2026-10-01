@@ -35,28 +35,11 @@ impl From<Message> for crate::pubsub::Message {
 }
 
 
-#[derive(Debug, Clone)]
-pub enum DeliveryState {
-    /// Message is waiting in queue to be fetched by a consumer.
-    Ready,
-    /// Message was fetched; contains the deadline(`Instant`) when visibility expires
-    InFlight{
-        deadline: Instant
-    }
-}
-
-
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DeadLetterPolicy {
     pub dead_letter_queue: String,
     pub max_delivery_attempts: u32,
 }
-
-pub struct PullRequest {
-    pub batch: Vec<Message>,
-    pub poison_messages: Vec<Message>
-}
-
 #[derive(Debug, Clone)]
 pub struct PushConfig {
     pub push_endpoint: String,

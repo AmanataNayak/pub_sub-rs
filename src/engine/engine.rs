@@ -213,25 +213,15 @@ impl Engine {
 
     /// Pulls a message from a specific subscription.
     pub fn pull_batch(&self, topic_name: &str, sub_name: &str, batch_size_override: Option<usize>) -> Result<Vec<Message>, PubSubError> {
-        let (batch, poison_messages, dlq_policy) = {
-            let topic_arc = self.get_topic(topic_name)?;
-            let mut topic = topic_arc.write().unwrap();
+        let topic_arc = self.get_topic(topic_name)?;
+        let mut topic = topic_arc.write().unwrap();
 
-            let sub = topic
-                .get_subscription_mut(sub_name)
-                .ok_or_else(|| PubSubError::SubscriptionNotFound(sub_name.to_string()))?;
+        let sub = topic
+            .get_subscription_mut(sub_name)
+            .ok_or_else(|| PubSubError::SubscriptionNotFound(sub_name.to_string()))?;
 
-            let res = sub.pull_batch(batch_size_override, topic_name);
+        let batch = sub.pull_batch(batch_size_override);
 
-            (res.batch, res.poison_messages, sub.dead_letter_policy.clone())
-        }; // Write lock on `topic` is explicitly dropped right here!
-
-        // Publish to DLQ outside the topic
-        if let Some(dlq_policy) = dlq_policy {
-            for msg in poison_messages {
-                let _ = self.publish(&dlq_policy.dead_letter_queue, msg);
-            }
-        }
         Ok(batch)
     }
 
@@ -275,6 +265,34 @@ impl Engine {
         // Returns a clone of the Arc<Notify> pointer
         Ok(sub.notify_handler())
     }
+
+    pub fn process_expired_messages(&self) {
+        let mut dead_letters = Vec::new();
+
+        // Collect arc pointers to all topics and drop the outer self.topics lock
+        let topic_arcs: Vec<Arc<RwLock<Topic>>> = {
+            let topics = self.topics.read().unwrap();
+            topics.values().cloned().collect()
+        };
+
+        // Iterate each topic, acquire its write lock & run requeue_expired()
+        for topic_arc in topic_arcs {
+            let mut topic = topic_arc.write().unwrap();
+
+            // Iterate mutably through all subscriptions inside this topic
+            for sub in topic.subscription.values_mut() {
+                let evicted = sub.requeue_expired();
+                dead_letters.extend(evicted);
+            }
+        } // All `Topic` write locks are dropped HERE
+
+        // Now that ALL locks are released, route dead-letter messages safely
+        for (dlq, msg) in dead_letters {
+            if !dlq.is_empty() {
+                let _ = self.publish(&dlq, msg);
+            }
+        }
+    }
 }
 
 
@@ -287,6 +305,7 @@ mod engine_tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
     use tokio::sync::mpsc;
+    use std::thread::sleep;
 
 
     fn dummy_msg(payload_str: &str) -> Message {
@@ -416,6 +435,7 @@ mod engine_tests {
 
         // Wait for visibility timeout to expire
         thread::sleep(Duration::from_millis(60));
+        engine.process_expired_messages();
 
         // Attempt 2: Pull message again (delivery_attempt = 2)
         let batch2 = engine.pull_batch("orders", "sub-payments", Some(1)).unwrap();
@@ -424,6 +444,7 @@ mod engine_tests {
 
         // Wait for visibility timeout to expire again
         thread::sleep(Duration::from_millis(60));
+        engine.process_expired_messages();
 
         // Attempt 3: Threshold hit! Pulling now should evict poison msg to 'orders-dlt' and return empty
         let batch3 = engine.pull_batch("orders", "sub-payments", Some(1)).unwrap();
@@ -440,10 +461,6 @@ mod engine_tests {
         assert_eq!(
             dlt_msg.attributes.get("x-dead-letter-source-subscription").unwrap(),
             "sub-payments"
-        );
-        assert_eq!(
-            dlt_msg.attributes.get("x-dead-letter-source-topic").unwrap(),
-            "orders"
         );
         assert_eq!(
             dlt_msg.attributes.get("x-dead-letter-delivery-attempts").unwrap(),
@@ -536,5 +553,115 @@ mod engine_tests {
             pending.is_empty(),
             "Message should be auto-ACKed after receiving HTTP 200 OK"
         );
+    }
+
+    #[test]
+    fn test_engine_sweep_routes_poison_message_to_dlq_topic() {
+        let engine = Engine::new();
+
+        // 1. Setup primary topic and DLQ topic
+        let main_topic = "orders";
+        let dlq_topic = "orders-dlq";
+        engine.create_topic(main_topic).unwrap();
+        engine.create_topic(dlq_topic).unwrap();
+
+        // 2. Setup subscription with DLQ policy (max 1 attempt)
+        let dlq_policy = DeadLetterPolicy {
+            dead_letter_queue: dlq_topic.to_string(),
+            max_delivery_attempts: 1,
+        };
+
+        engine
+            .create_subscription(
+                main_topic,
+                "sub-orders",
+                Duration::from_millis(20), // 20ms visibility deadline
+                Some(10),
+                None,
+                Some( dlq_topic.to_string()),
+                Some(1)
+            )
+            .unwrap();
+
+        // Create a listener subscription on the DLQ topic to verify receipt
+        engine
+            .create_subscription(dlq_topic, "sub-dlq-listener", Duration::from_secs(10), Some(10), None, None, None)
+            .unwrap();
+
+        // 3. Publish message to main topic
+        let msg = dummy_msg("m-poison");
+        let msg_id = msg.id.clone();
+        engine.publish(main_topic, msg).unwrap();
+
+        // 4. Pull message once (delivery_attempt becomes 1)
+        let pulled = engine.pull_batch(main_topic, "sub-orders", Some(1)).unwrap();
+        assert_eq!(pulled.len(), 1);
+        assert_eq!(pulled[0].id, msg_id);
+
+        // 5. Allow visibility deadline to expire (30ms > 20ms)
+        sleep(Duration::from_millis(30));
+
+        // 6. Trigger Engine expiration sweep
+        engine.process_expired_messages();
+
+        // 7. Verify message is removed from primary subscription
+        let primary_pull = engine.pull_batch(main_topic, "sub-orders", Some(1)).unwrap();
+        assert!(primary_pull.is_empty(), "Poison message should be evicted from main subscription");
+
+        // 8. Verify message was routed to the DLQ topic and received by DLQ listener
+        let dlq_pulled = engine.pull_batch(dlq_topic, "sub-dlq-listener", Some(1)).unwrap();
+        assert_eq!(dlq_pulled.len(), 1, "DLQ topic should contain the evicted message");
+        assert_eq!(dlq_pulled[0].id, msg_id);
+
+        // Verify metadata attributes attached by Subscription
+        assert_eq!(
+            dlq_pulled[0].attributes.get("x-dead-letter-source-subscription").map(|s| s.as_str()),
+            Some("sub-orders")
+        );
+    }
+
+    #[test]
+    fn test_engine_sweep_requeues_normal_unexpired_retry() {
+        let engine = Engine::new();
+
+        let main_topic = "events";
+        let dlq_topic = "events-dlq";
+        engine.create_topic(main_topic).unwrap();
+        engine.create_topic(dlq_topic).unwrap();
+
+        // DLQ policy allows up to 3 attempts
+        let dlq_policy = DeadLetterPolicy {
+            dead_letter_queue: dlq_topic.to_string(),
+            max_delivery_attempts: 3,
+        };
+
+        engine
+            .create_subscription(
+                main_topic,
+                "sub-events",
+                Duration::from_millis(20),
+                Some(10),
+                None,
+                Some(dlq_topic.to_string()),
+                Some(5)
+            )
+            .unwrap();
+        let msg = dummy_msg("m-retry");
+        let msg_id = msg.id.clone();
+
+        engine.publish(main_topic, msg).unwrap();
+
+        // Pull 1 (attempt 1)
+        let _ = engine.pull_batch(main_topic, "sub-events", Some(1)).unwrap();
+        sleep(Duration::from_millis(30));
+
+        // Sweep should requeue to ready_queue because attempts (1) < max_attempts (3)
+        engine.process_expired_messages();
+
+        // Pull 2 should retrieve the message again with incremented attempt
+        let repulled = engine.pull_batch(main_topic, "sub-events", Some(1)).unwrap();
+        assert_eq!(repulled.len(), 1);
+        assert_eq!(repulled[0].id, msg_id);
+        assert_eq!(repulled[0].delivery_attempt, 2);
     }
 }

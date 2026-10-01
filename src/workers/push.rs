@@ -231,6 +231,9 @@ mod push_worker_tests {
         sleep(Duration::from_millis(600)).await;
 
         // 7. Verify message is STILL present in engine memory
+
+        engine.process_expired_messages();
+        
         let pending = engine
             .pull_batch("fail-topic", "fail-sub", Some(1))
             .unwrap();
