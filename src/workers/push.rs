@@ -33,6 +33,9 @@ pub fn spawn_push_workers(topic_name: String, sub_name: String, push_config: Pus
                     if let Ok(resp) = req.send().await {
                         if resp.status().is_success() {
                             let _ = engine.ack_batch(&topic_name, &sub_name, &[msg.id]);
+                        } else if resp.status().is_client_error(){
+                            // Transferring clien error to DLQ for review
+                            let _ = engine.nack_batch(&topic_name, &sub_name, &[msg.id]);
                         }
                     }
                 }
