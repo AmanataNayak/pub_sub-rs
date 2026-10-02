@@ -6,6 +6,7 @@ use std::sync::Mutex;
 use crate::model::{Message};
 use serde_json;
 use serde::{Deserialize, Serialize};
+use std::time::Duration;
 
 #[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub enum WalEntry {
@@ -24,6 +25,8 @@ pub enum WalEntry {
         dead_letter_queue: Option<String>,
         #[serde(default)]
         max_delivery_attempts: Option<u32>,
+        #[serde(default)]
+        message_ttl: Option<Duration>,
         push_endpoint: Option<String>,
         headers: Option<HashMap<String, String>>,
         timeout_secs: Option<u64>
@@ -132,6 +135,7 @@ mod tests {
             max_outstanding_messages: None,
             dead_letter_queue: None,
             max_delivery_attempts: None,
+            message_ttl: None,
             push_endpoint: None,
             timeout_secs: None,
             headers: None

@@ -67,7 +67,7 @@ impl Engine {
     }
 
     /// Creates a subscription under a topic.
-    pub fn create_subscription(&self, topic_name: &str, sub_name: &str, ack_deadline: Duration, batch_size: Option<usize>, max_outstanding_messages: Option<usize>, dead_letter_queue: Option<String>, max_delivery_attempts: Option<u32>) -> Result<(), PubSubError> {
+    pub fn create_subscription(&self, topic_name: &str, sub_name: &str, ack_deadline: Duration, batch_size: Option<usize>, max_outstanding_messages: Option<usize>, message_ttl: Option<Duration>, dead_letter_queue: Option<String>, max_delivery_attempts: Option<u32>) -> Result<(), PubSubError> {
         let topic_arc = self.get_topic(topic_name)?;
 
         // Build DLQ Policy ONLY if a dead_letter_queue was explicitly provided
@@ -100,6 +100,7 @@ impl Engine {
                 max_outstanding_messages,
                 dead_letter_queue: dead_letter_policy.as_ref().map(|p| p.dead_letter_queue.clone()),
                 max_delivery_attempts,
+                message_ttl,
                 push_endpoint: None,
                 timeout_secs: None,
                 headers: None
@@ -113,6 +114,7 @@ impl Engine {
             ack_deadline,
             batch_size,
             max_outstanding_messages,
+            message_ttl,
             dead_letter_policy,
         );
 
@@ -120,7 +122,7 @@ impl Engine {
         Ok(())
     }
 
-    pub fn create_push_subscription(&self, topic_name: &str, sub_name: &str, push_endpoint: &str, headers: HashMap<String, String>, timeout_secs: Option<u64>, ack_deadline: Duration, batch_size: Option<usize>, max_outstanding_messages: Option<usize>, dead_letter_queue: Option<String>, max_delivery_attempts: Option<u32>) -> Result<(), PubSubError> {
+    pub fn create_push_subscription(&self, topic_name: &str, sub_name: &str, push_endpoint: &str, headers: HashMap<String, String>, timeout_secs: Option<u64>, ack_deadline: Duration, batch_size: Option<usize>, max_outstanding_messages: Option<usize>, message_ttl: Option<Duration>, dead_letter_queue: Option<String>, max_delivery_attempts: Option<u32>) -> Result<(), PubSubError> {
         let batch_size = batch_size.unwrap_or(1);
         // Validate DLQ
         let dead_letter_policy = if let Some(dlq_name) = dead_letter_queue {
@@ -152,6 +154,7 @@ impl Engine {
                 max_outstanding_messages,
                 dead_letter_queue: dead_letter_policy.as_ref().map(|p| p.dead_letter_queue.clone()),
                 max_delivery_attempts,
+                message_ttl,
                 push_endpoint: Some(push_config.push_endpoint.clone()),
                 timeout_secs: Some(push_config.timeout_secs),
                 headers: Some(push_config.headers.clone()),
@@ -174,6 +177,7 @@ impl Engine {
                 push_config.clone(),
                 batch_size,
                 max_outstanding_messages,
+                message_ttl,
                 dead_letter_policy,
             );
             topic.get_subscription(sub_name).unwrap().notify_handler()
@@ -220,9 +224,12 @@ impl Engine {
             .get_subscription_mut(sub_name)
             .ok_or_else(|| PubSubError::SubscriptionNotFound(sub_name.to_string()))?;
 
-        let batch = sub.pull_batch(batch_size_override);
+        let pull_response = sub.pull_batch(batch_size_override);
+        for (queue, msg) in pull_response.dead_letter {
+            let _ = self.publish(&queue, msg);
+        }
 
-        Ok(batch)
+        Ok(pull_response.batch)
     }
 
     /// Acknowledges a message on a subscription
@@ -279,6 +286,8 @@ impl Engine {
             for sub in topic.subscription.values_mut() {
                 let evicted = sub.requeue_expired();
                 dead_letters.extend(evicted);
+                // sweep the messages
+                sub.sweep_expired_ttl();
             }
         } // All `Topic` write locks are dropped HERE
 
@@ -337,7 +346,7 @@ mod engine_tests {
     use tokio::sync::mpsc;
     use crate::engine::subscription::Subscription;
     use std::thread::sleep;
-
+    use std::time::Instant;
 
     fn dummy_msg(payload_str: &str) -> Message {
         Message::new(bytes::Bytes::from(payload_str.as_bytes().to_vec()), HashMap::new())
@@ -356,14 +365,14 @@ mod engine_tests {
 
         // Subscription under non-existent topic
         assert_eq!(
-            engine.create_subscription("missing-topic", "sub-1", Duration::from_secs(5), Some(5), None, None, None).unwrap_err(),
+            engine.create_subscription("missing-topic", "sub-1", Duration::from_secs(5), Some(5), None, None, None, None).unwrap_err(),
             PubSubError::TopicNotFound("missing-topic".to_string())
         );
 
         // Duplicate subscription under existing topic
-        assert!(engine.create_subscription("payments", "sub-1", Duration::from_secs(5), Some(5), None, None, None).is_ok());
+        assert!(engine.create_subscription("payments", "sub-1", Duration::from_secs(5), Some(5), None, None, None, None).is_ok());
         assert_eq!(
-            engine.create_subscription("payments", "sub-1", Duration::from_secs(5), Some(5), None, None, None).unwrap_err(),
+            engine.create_subscription("payments", "sub-1", Duration::from_secs(5), Some(5), None, None, None, None).unwrap_err(),
             PubSubError::SubscriptionAlreadyExists("sub-1".to_string())
         );
 
@@ -382,7 +391,7 @@ mod engine_tests {
     fn test_concurrent_multithreaded_publish_and_pull() {
         let engine = Arc::new(Engine::new());
         engine.create_topic("events").unwrap();
-        engine.create_subscription("events", "sub-workers", Duration::from_secs(10), Some(10), None, None, None).unwrap();
+        engine.create_subscription("events", "sub-workers", Duration::from_secs(10), Some(10), None, None, None, None).unwrap();
 
         let mut handles = vec![];
 
@@ -437,7 +446,7 @@ mod engine_tests {
 
         // 2. Create DLT subscription to read evicted poison messages
         engine
-            .create_subscription("orders-dlt", "dlt-sub", Duration::from_secs(10), None, None, None, None)
+            .create_subscription("orders-dlt", "dlt-sub", Duration::from_secs(10), None, None, None, None, None)
             .unwrap();
 
         // 3. Create main subscription with max 2 delivery attempts and DLT configured
@@ -448,6 +457,7 @@ mod engine_tests {
                 "sub-payments",
                 ack_deadline,
                 Some(10),
+                None,
                 None,
                 Some("orders-dlt".to_string()), // dead_letter_topic
                 Some(2),                      // max_delivery_attempts
@@ -542,6 +552,7 @@ mod engine_tests {
                 Duration::from_secs(10), // ack_deadline
                 Some(1),              //Batch size
                 None,                    // max_outstanding_messages
+                None,                 // message_ttl
                 None,                    // dead_letter_queue
                 Some(5),                 // max_delivery_attempts
             )
@@ -557,6 +568,7 @@ mod engine_tests {
                     payload: bytes::Bytes::from(msg_payload),
                     attributes: HashMap::new(),
                     delivery_attempt: 0,
+                    created_at: Instant::now()
                 },
             )
             .unwrap();
@@ -610,6 +622,7 @@ mod engine_tests {
                 Duration::from_millis(20), // 20ms visibility deadline
                 Some(10),
                 None,
+                None,
                 Some( dlq_topic.to_string()),
                 Some(1)
             )
@@ -617,7 +630,7 @@ mod engine_tests {
 
         // Create a listener subscription on the DLQ topic to verify receipt
         engine
-            .create_subscription(dlq_topic, "sub-dlq-listener", Duration::from_secs(10), Some(10), None, None, None)
+            .create_subscription(dlq_topic, "sub-dlq-listener", Duration::from_secs(10), Some(10), None, None, None, None)
             .unwrap();
 
         // 3. Publish message to main topic
@@ -674,6 +687,7 @@ mod engine_tests {
                 Duration::from_millis(20),
                 Some(10),
                 None,
+                None,
                 Some(dlq_topic.to_string()),
                 Some(5)
             )
@@ -705,6 +719,7 @@ mod engine_tests {
             10,
             None,
             None,
+            None,
         );
 
         sub.push(dummy_msg("msg-1"));
@@ -712,7 +727,7 @@ mod engine_tests {
         sub.push(dummy_msg("msg-3"));
 
         // Pull 3 messages into InFlight
-        let pulled = sub.pull_batch(Some(3));
+        let pulled = sub.pull_batch(Some(3)).batch;
         assert_eq!(pulled.len(), 3);
 
         let ids: Vec<String> = pulled.iter().map(|m| m.id.clone()).collect();
@@ -723,7 +738,7 @@ mod engine_tests {
 
         // Verify storage is empty and pulling returns nothing
         assert_eq!(sub.len(), 0);
-        assert!(sub.pull_batch(Some(10)).is_empty());
+        assert!(sub.pull_batch(Some(10)).batch.is_empty());
     }
 
     #[test]
@@ -734,12 +749,13 @@ mod engine_tests {
             10,
             None,
             None,
+            None,
         );
 
         sub.push(dummy_msg("valid-1"));
         sub.push(dummy_msg("valid-2"));
 
-        let pulled = sub.pull_batch(Some(2));
+        let pulled = sub.pull_batch(Some(2)).batch;
         let mut ids: Vec<String> = pulled.iter().map(|m| m.id.clone()).collect();
 
         // Inject non-existent ID into the batch
@@ -766,7 +782,7 @@ mod engine_tests {
 
         // Create DLT listener subscription
         engine
-            .create_subscription(dlq_topic, "sub-dlq-audit", Duration::from_secs(10), Some(10), None, None, None)
+            .create_subscription(dlq_topic, "sub-dlq-audit", Duration::from_secs(10), Some(10), None, None, None, None)
             .unwrap();
 
         // Create main subscription with DLQ enabled
@@ -776,6 +792,7 @@ mod engine_tests {
                 "sub-orders-proc",
                 Duration::from_secs(10),
                 Some(10),
+                None,
                 None,
                 Some(dlq_topic.to_string()),
                 Some(3),

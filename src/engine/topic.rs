@@ -21,7 +21,7 @@ impl Topic {
     }
 
     /// Register a new subscription under this topic
-    pub fn create_subscription(&mut self, name: &str, ack_deadline: Duration, batch_size: usize, max_outstanding_messages: Option<usize>, dead_letter_policy: Option<DeadLetterPolicy>,) -> bool {
+    pub fn create_subscription(&mut self, name: &str, ack_deadline: Duration, batch_size: usize, max_outstanding_messages: Option<usize>, message_ttl: Option<Duration>, dead_letter_policy: Option<DeadLetterPolicy>,) -> bool {
         if self.subscription.contains_key(name) {
             return false; // Already exists
         }
@@ -30,13 +30,14 @@ impl Topic {
             ack_deadline,
             batch_size,
             max_outstanding_messages,
+            message_ttl,
             dead_letter_policy
         );
         self.subscription.insert(name.to_string(), sub);
         true
     }
 
-    pub fn create_push_subscription(&mut self, name: &str, ack_deadline: Duration, push_config: PushConfig, batch_size: usize, max_outstanding_messages: Option<usize>, dead_letter_policy: Option<DeadLetterPolicy>) -> bool {
+    pub fn create_push_subscription(&mut self, name: &str, ack_deadline: Duration, push_config: PushConfig, batch_size: usize, max_outstanding_messages: Option<usize>, message_ttl: Option<Duration>, dead_letter_policy: Option<DeadLetterPolicy>) -> bool {
         if self.subscription.contains_key(name) {
             return false; // Already exits
         }
@@ -47,6 +48,7 @@ impl Topic {
             push_config,
             batch_size,
             max_outstanding_messages,
+            message_ttl,
             dead_letter_policy
         );
 
@@ -95,8 +97,8 @@ mod topic_tests {
     fn test_fanout_isolation_and_independent_acks() {
         let mut topic = Topic::new("orders".to_string());
 
-        topic.create_subscription("sub-billing", Duration::from_secs(10), 5, None, None);
-        topic.create_subscription("sub-analytics", Duration::from_secs(10), 5, None, None);
+        topic.create_subscription("sub-billing", Duration::from_secs(10), 5, None, None, None);
+        topic.create_subscription("sub-analytics", Duration::from_secs(10), 5, None, None, None);
 
         let msg = dummy_msg("Order #99");
         let msg_id = msg.id.clone();
@@ -105,13 +107,13 @@ mod topic_tests {
         // Both subscriptions must receive their own copy
         let billing_msgs = {
             let sub = topic.get_subscription_mut("sub-billing").unwrap();
-            sub.pull_batch(None)
+            sub.pull_batch(None).batch
         };
         assert_eq!(billing_msgs.len(), 1);
 
         let analytics_msgs = {
             let sub = topic.get_subscription_mut("sub-analytics").unwrap();
-            sub.pull_batch(None)
+            sub.pull_batch(None).batch
         };
         assert_eq!(analytics_msgs.len(), 1);
 
@@ -133,9 +135,9 @@ mod topic_tests {
         let mut topic = Topic::new("orders".to_string());
 
         // Sub A: Unbounded (None)
-        topic.create_subscription("sub-unbounded", Duration::from_secs(10), 10, None, None);
+        topic.create_subscription("sub-unbounded", Duration::from_secs(10), 10, None, None, None);
         // Sub B: Capped at 1 message
-        topic.create_subscription("sub-capped", Duration::from_secs(10), 10, Some(1), None);
+        topic.create_subscription("sub-capped", Duration::from_secs(10), 10, Some(1), None, None);
 
         let msg1 = dummy_msg("Order #1");
         let msg2 = dummy_msg("Order #2");

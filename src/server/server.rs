@@ -81,8 +81,9 @@ impl PubSubService for MyPubSubService {
             Some(dlp) => (Some(dlp.dead_letter_queue), dlp.max_delivery_attempts),
             None => (None, None)
         };
+        let message_ttl = req.message_ttl_secs.map(Duration::from_secs);
 
-        let _ = self.engine.create_push_subscription(&req.topic, &req.subscription, &req.push_endpoint, req.headers, req.timeout_secs, ack_deadline, batch_size, max_outstanding_messages, dead_letter_queue, max_delivery_attempts).map_err(Status::from)?;
+        let _ = self.engine.create_push_subscription(&req.topic, &req.subscription, &req.push_endpoint, req.headers, req.timeout_secs, ack_deadline, batch_size, max_outstanding_messages, message_ttl, dead_letter_queue, max_delivery_attempts).map_err(Status::from)?;
         Ok(Response::new(CreateSubscriptionResponse { success: true }))
     }
 
@@ -106,9 +107,10 @@ impl PubSubService for MyPubSubService {
             None => (None, None)
         };
 
+        let message_ttl = req.message_ttl_secs.map(Duration::from_secs);
 
         self.engine
-            .create_subscription(&req.topic, &req.subscription, ack_deadline, batch_size, max_outstanding_messages, dead_letter_queue, max_delivery_attempts)
+            .create_subscription(&req.topic, &req.subscription, ack_deadline, batch_size, max_outstanding_messages, message_ttl, dead_letter_queue, max_delivery_attempts)
             .map_err(Status::from)?;
 
         Ok(Response::new(CreateSubscriptionResponse { success: true }))

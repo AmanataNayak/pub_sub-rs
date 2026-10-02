@@ -108,7 +108,7 @@ mod push_worker_tests {
     use super::*;
     use std::collections::HashMap;
     use crate::model::Message;
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
     use tokio::io::{AsyncReadExt, AsyncWriteExt}; // Trait imports required for socket.read/write
     use tokio::net::TcpListener;
     use tokio::sync::mpsc;
@@ -148,6 +148,7 @@ mod push_worker_tests {
                 None,
                 None,
                 None,
+                None,
             )
             .unwrap();
 
@@ -184,6 +185,7 @@ mod push_worker_tests {
                     payload:bytes::Bytes::from(b"Direct Worker Payload".to_vec()),
                     attributes: HashMap::new(),
                     delivery_attempt: 0,
+                    created_at: Instant::now()
                 },
             )
             .unwrap();
@@ -244,6 +246,7 @@ mod push_worker_tests {
                 None,
                 None,
                 None,
+                None,
             )
             .unwrap();
 
@@ -276,6 +279,7 @@ mod push_worker_tests {
                     payload:bytes::Bytes::from(b"Failing Payload".to_vec()),
                     attributes: HashMap::new(),
                     delivery_attempt: 0,
+                    created_at: Instant::now()
                 },
             )
             .unwrap();

@@ -32,7 +32,8 @@ message CreateSubscriptionRequest {
   uint64 ack_deadline_secs = 3;
   optional uint32 batch_size = 4;
   optional uint32 max_outstanding_messages = 5;
-  optional DeadLetterPolicy dead_letter_policy = 6;
+  optional uint64 message_ttl_secs = 6;
+  optional DeadLetterPolicy dead_letter_policy = 7;
 }
 
 message CreateSubscriptionResponse {
@@ -49,7 +50,8 @@ message CreatePushSubscriptionRequest {
   optional uint32 batch_size = 6;
   optional uint64 timeout_secs = 7;
   optional uint32 max_outstanding_messages = 8;
-  optional DeadLetterPolicy dead_letter_policy = 9;
+  optional uint64 message_ttl_secs = 9;
+  optional DeadLetterPolicy dead_letter_policy = 10;
 }
 
 message PublishRequest {

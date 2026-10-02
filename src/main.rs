@@ -70,6 +70,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 max_outstanding_messages,
                 dead_letter_queue,
                 max_delivery_attempts,
+                message_ttl,
                 push_endpoint,
                 headers,
                 timeout_secs,
@@ -86,6 +87,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         ack_deadline,
                         Some(batch_size),
                         max_outstanding_messages,
+                        message_ttl,
                         dead_letter_queue,
                         max_delivery_attempts,
                     );
@@ -96,6 +98,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         ack_deadline,
                         Some(batch_size),
                         max_outstanding_messages,
+                        message_ttl,
                         dead_letter_queue,
                         max_delivery_attempts,
                     );
