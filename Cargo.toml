@@ -18,6 +18,7 @@ tonic = "0.12"
 prost = "0.13"
 reqwest = "0.12"
 bytes = { version = "1.10", features = ["serde"] }
+serde_millis = "0.1.1"
 
 [build-dependencies]
 tonic-build = "0.12"
