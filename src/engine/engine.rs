@@ -1,13 +1,15 @@
+use std::alloc::System;
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
-use std::time::Duration;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::Notify;
-
+use crate::engine::topic::Subscription;
 pub use crate::engine::topic::Topic;
 use crate::errors::PubSubError;
 use crate::model::{DeadLetterPolicy, Message, PushConfig};
 use crate::workers::spawn_push_workers;
-use crate::storage::{WalEntry, WalManager};
+use crate::storage::{DeadLetterPolicyState, PersistentMessage, PushConfigState, SubscriptionState, TopicState, WalEntry, WalManager, SnapshotHeader};
+use crate::storage::{EngineSnapshot};
 
 
 #[derive(Clone)]
@@ -332,11 +334,195 @@ impl Engine {
 
         Ok(nack_count)
     }
+
+    /// Extract a complete, serializable snapshot of the engine state (Engine -> EngineSnapShot)
+    pub fn create_snapshot(&self, checkpoint_lsn: u64) -> EngineSnapshot {
+        let now_instant = Instant::now();
+        let now_epoc_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+
+        let topic_guard = self.topics.read().unwrap();
+        let mut topic_snapshot = HashMap::new();
+        let mut unacked_messages = HashMap::new();
+
+        for (topic_name, topic_arc) in topic_guard.iter() {
+            let topic = topic_arc.read().unwrap();
+            let mut sub_snapshot = HashMap::new();
+
+            for (sub_name, sub) in topic.subscription.iter() {
+
+                // Convert in-flight deadline Instants to Unix Epoch MS
+                let mut in_flight_snap = HashMap::new();
+                for (msg_id, deadline_instant) in &sub.in_flight {
+                    let deadline_ms = if *deadline_instant > now_instant {
+                        let remaining = *deadline_instant - now_instant;
+                        now_epoc_ms + remaining.as_millis() as u64
+                    } else {
+                        now_epoc_ms // expired while taking snapshot; will requeue on boot
+                    };
+                    in_flight_snap.insert(msg_id.clone(), deadline_ms);
+                }
+
+                // collect active unacked messages
+                for (msg_id, msg) in &sub.messages {
+                    if !unacked_messages.contains_key(msg_id) {
+                        let elapsed = now_instant.saturating_duration_since(msg.created_at);
+                        let created_at_ms = now_epoc_ms.saturating_sub(elapsed.as_millis() as u64);
+
+                        unacked_messages.insert(
+                            msg_id.clone(),
+                            PersistentMessage {
+                                id: msg_id.clone(),
+                                payload: msg.payload.to_vec(),
+                                attributes: msg.attributes.clone(),
+                                delivery_attempt: msg.delivery_attempt,
+                                created_at_ms
+                            }
+                        );
+                    }
+                }
+
+                // Map dead letter policy
+                let dlq_state = sub.dead_letter_policy.as_ref().map(|p| DeadLetterPolicyState {
+                    dead_letter_queue: p.dead_letter_queue.clone(),
+                    max_delivery_attempts: p.max_delivery_attempts
+                });
+
+                // Map PushConfig
+                let push_state = sub.push_config.as_ref().map(|pc| PushConfigState {
+                    push_endpoint: pc.push_endpoint.clone(),
+                    headers: pc.headers.clone(),
+                    timeout_secs: pc.timeout_secs
+                });
+
+                // Build subscription state
+                sub_snapshot.insert(
+                    sub_name.clone(),
+                    SubscriptionState {
+                        name: sub.name.clone(),
+                        ack_deadline_secs: sub.ack_deadline.as_secs(),
+                        push_config: push_state,
+                        batch_size: sub.batch_size,
+                        max_outstanding_messages: sub.max_outstanding_messages,
+                        message_ttl_secs: sub.message_ttl.map(|d| d.as_secs()),
+                        dropped_messages: sub.dropped_messages,
+                        dead_letter_policy: dlq_state,
+                        ready_queue: sub.ready_queue.clone(),
+                        in_flight: in_flight_snap,
+                    }
+                );
+            }
+
+            topic_snapshot.insert(
+                topic_name.clone(),
+                TopicState {
+                    name: topic_name.clone(),
+                    subscriptions: sub_snapshot
+                }
+            );
+        }
+
+        EngineSnapshot {
+            header: SnapshotHeader {
+                magic: *b"PSSN",
+                version: 1,
+                checkpoint_lsn,
+                timestamp_ms: now_epoc_ms
+            },
+            topics: topic_snapshot,
+            messages: unacked_messages,
+        }
+    }
+
+    /// Restore complete in-memory engine state from a loaded EngineSnapShot (EngineSnapShot -> Engine)
+    pub fn restore_from_snapshot(snapshot: EngineSnapshot) -> Self {
+        let engine = Engine::new();
+        let now_instant = Instant::now();
+        let now_epoch_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        {
+            let mut topic_guard = engine.topics.write().unwrap();
+
+            for (topic_name, topic_state) in snapshot.topics {
+                let mut topic = Topic::new(topic_name.clone());
+
+                for (sub_name, sub_state) in topic_state.subscriptions {
+                    let dlq_policy = sub_state.dead_letter_policy.map(|p| DeadLetterPolicy {
+                        dead_letter_queue: p.dead_letter_queue,
+                        max_delivery_attempts: p.max_delivery_attempts
+                    });
+
+                    let push_cfg = sub_state.push_config.map(|pc| PushConfig {
+                        push_endpoint: pc.push_endpoint,
+                        headers: pc.headers,
+                        timeout_secs: pc.timeout_secs
+                    });
+
+                    let mut sub = Subscription {
+                        name: sub_state.name,
+                        ack_deadline: Duration::from_secs(sub_state.ack_deadline_secs),
+                        ready_queue: sub_state.ready_queue,
+                        messages: HashMap::new(),
+                        in_flight: HashMap::new(),
+                        push_config: push_cfg,
+                        batch_size: sub_state.batch_size,
+                        max_outstanding_messages: sub_state.max_outstanding_messages,
+                        message_ttl: sub_state.message_ttl_secs.map(Duration::from_secs),
+                        dropped_messages: sub_state.dropped_messages,
+                        dead_letter_policy: dlq_policy,
+                        notify: Arc::new(Notify::new()),
+                    };
+
+                    // Reconstruct in_flight map
+                    for (msg_id, deadline_ms) in sub_state.in_flight {
+                        let deadline_instant = if deadline_ms > now_epoch_ms {
+                            let remaining = Duration::from_millis(deadline_ms - now_epoch_ms);
+                            now_instant + remaining
+                        } else {
+                            now_instant.checked_sub(Duration::from_millis(1)).unwrap_or(now_instant) // Timed out while server was offline
+                        };
+                        sub.in_flight.insert(msg_id, deadline_instant);
+                    }
+
+                    // Reconstruct active messages map (created_at_ms -> Instant)
+                    for msg_id in sub.ready_queue.iter().chain(sub.in_flight.keys()) {
+                        if let Some(p_msg) = snapshot.messages.get(msg_id) {
+                            let created_at_instant = if now_epoch_ms >= p_msg.created_at_ms {
+                                let elapsed = Duration::from_millis(now_epoch_ms - p_msg.created_at_ms);
+                                now_instant.checked_sub(elapsed).unwrap_or(now_instant)
+                            } else {
+                                now_instant
+                            };
+
+                            let msg = Message {
+                                id: p_msg.id.clone(),
+                                payload: bytes::Bytes::from(p_msg.payload.clone()),
+                                attributes: p_msg.attributes.clone(),
+                                delivery_attempt: p_msg.delivery_attempt,
+                                created_at: created_at_instant,
+                            };
+
+                            sub.messages.insert(msg_id.clone(), msg);
+                        }
+                    }
+                    topic.subscription.insert(sub_name, sub);
+                }
+                topic_guard.insert(topic_name, Arc::new(RwLock::new(topic)));
+            }
+        }
+        engine
+
+    }
 }
 
 
 #[cfg(test)]
-mod engine_tests {
+mod engine_tests
+{
     use super::*;
     use std::collections::HashMap;
     use std::sync::Arc;
@@ -347,6 +533,7 @@ mod engine_tests {
     use crate::engine::subscription::Subscription;
     use std::thread::sleep;
     use std::time::Instant;
+    use bytes::Bytes;
 
     fn dummy_msg(payload_str: &str) -> Message {
         Message::new(bytes::Bytes::from(payload_str.as_bytes().to_vec()), HashMap::new())
@@ -824,5 +1011,157 @@ mod engine_tests {
             dlq_pull[0].attributes.get("x-dead-letter-source-subscription").map(|s| s.as_str()),
             Some("sub-orders-proc")
         );
+    }
+
+    fn mock_message(id: &str) -> Message {
+        Message {
+            id: id.to_string(),
+            payload: Bytes::from_static(b"payload-bytes"),
+            attributes: HashMap::from([("key".to_string(), "val".to_string())]),
+            delivery_attempt: 0,
+            created_at: Instant::now(),
+        }
+    }
+
+    #[test]
+    fn test_snapshot_roundtrip_full_state() {
+        let engine = Engine::new();
+        engine.create_topic("orders").unwrap();
+        engine
+            .create_subscription("orders", "sub-orders", Duration::from_secs(30), Some(10), None, None, None, None)
+            .unwrap();
+
+        engine.publish("orders", mock_message("msg-101")).unwrap();
+        engine.publish("orders", mock_message("msg-102")).unwrap();
+
+        // 1. Capture snapshot at LSN 500
+        let snapshot = engine.create_snapshot(500);
+        assert_eq!(snapshot.header.checkpoint_lsn, 500);
+        assert_eq!(snapshot.messages.len(), 2);
+        assert!(snapshot.topics.contains_key("orders"));
+
+        // 2. Restore into clean engine instance
+        let restored_engine = Engine::restore_from_snapshot(snapshot);
+
+        // 3. Verify pulled messages from restored engine
+        let pulled = restored_engine
+            .pull_batch("orders", "sub-orders", Some(10))
+            .unwrap();
+
+        assert_eq!(pulled.len(), 2);
+        assert_eq!(pulled[0].id, "msg-101");
+        assert_eq!(pulled[1].id, "msg-102");
+        assert_eq!(pulled[0].attributes.get("key").unwrap(), "val");
+    }
+
+    #[test]
+    fn test_snapshot_in_flight_timeout_recovery() {
+        let engine = Engine::new();
+        engine.create_topic("tasks").unwrap();
+        engine
+            .create_subscription("tasks", "sub-tasks", Duration::from_millis(50), Some(10), None, None, None, None)
+            .unwrap();
+
+        engine.publish("tasks", mock_message("task-1")).unwrap();
+
+        // Pull message into in_flight state
+        let pulled = engine.pull_batch("tasks", "sub-tasks", Some(1)).unwrap();
+        assert_eq!(pulled.len(), 1);
+
+        // Take snapshot while task-1 is actively in-flight
+        let snapshot = engine.create_snapshot(100);
+
+        // Simulate server offline time: sleep past the 50ms visibility deadline
+        sleep(Duration::from_millis(60));
+
+        // Restore engine
+        let restored_engine = Engine::restore_from_snapshot(snapshot);
+
+        // Run janitor pass to requeue offline-expired in-flight messages
+        {
+            let topic = restored_engine.get_topic("tasks").unwrap();
+            let mut topic_guard = topic.write().unwrap();
+            let sub = topic_guard.get_subscription_mut("sub-tasks").unwrap();
+            let dlq = sub.requeue_expired();
+            assert!(dlq.is_empty()); // No DLQ configured
+        }
+
+        // Verify message is back in ready_queue and can be pulled again
+        let re_pulled = restored_engine
+            .pull_batch("tasks", "sub-tasks", Some(1))
+            .unwrap();
+        assert_eq!(re_pulled.len(), 1);
+        assert_eq!(re_pulled[0].id, "task-1");
+        assert_eq!(re_pulled[0].delivery_attempt, 2); // Incremented attempt counter
+    }
+
+    #[test]
+    fn test_snapshot_ttl_expiration_after_restore() {
+        let engine = Engine::new();
+        engine.create_topic("alerts").unwrap();
+        engine
+            .create_subscription(
+                "alerts",
+                "sub-alerts",
+                Duration::from_secs(10),
+                Some(10),
+                None,
+                Some(Duration::from_millis(50)), // 50ms TTL
+                None,
+                None
+            )
+            .unwrap();
+
+        engine.publish("alerts", mock_message("alert-1")).unwrap();
+
+        let snapshot = engine.create_snapshot(200);
+
+        // Sleep past TTL expiration window
+        sleep(Duration::from_millis(60));
+
+        let restored_engine = Engine::restore_from_snapshot(snapshot);
+
+        // Run TTL sweep on restored engine
+        {
+            let topic = restored_engine.get_topic("alerts").unwrap();
+            let mut topic_guard = topic.write().unwrap();
+            let sub = topic_guard.get_subscription_mut("sub-alerts").unwrap();
+            sub.sweep_expired_ttl();
+        }
+
+        // Queue should be purged
+        let pulled = restored_engine
+            .pull_batch("alerts", "sub-alerts", Some(10))
+            .unwrap();
+        assert!(pulled.is_empty());
+    }
+
+    #[test]
+    fn test_snapshot_deduplication_across_multiple_subscriptions() {
+        let engine = Engine::new();
+        engine.create_topic("events").unwrap();
+        engine
+            .create_subscription("events", "sub-a", Duration::from_secs(10), Some(10), None, None, None, None)
+            .unwrap();
+        engine
+            .create_subscription("events", "sub-b", Duration::from_secs(10), Some(10), None, None, None, None)
+            .unwrap();
+
+        // Publish single message fanning out to sub-a and sub-b
+        engine.publish("events", mock_message("shared-msg")).unwrap();
+
+        let snapshot = engine.create_snapshot(300);
+
+        // Verify payload was deduplicated in snapshot DTO
+        assert_eq!(snapshot.messages.len(), 1);
+
+        let restored_engine = Engine::restore_from_snapshot(snapshot);
+
+        // Both subscriptions pull the restored payload independently
+        let pulled_a = restored_engine.pull_batch("events", "sub-a", Some(1)).unwrap();
+        let pulled_b = restored_engine.pull_batch("events", "sub-b", Some(1)).unwrap();
+
+        assert_eq!(pulled_a[0].id, "shared-msg");
+        assert_eq!(pulled_b[0].id, "shared-msg");
     }
 }

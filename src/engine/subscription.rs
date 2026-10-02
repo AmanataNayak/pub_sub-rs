@@ -11,11 +11,11 @@ pub struct Subscription {
     pub name: String,
     pub ack_deadline: Duration,
     // O(1) Queue of message IDs ready for delivery
-    ready_queue: VecDeque<String>,
+    pub ready_queue: VecDeque<String>,
     // Storage for active messages
-    messages: HashMap<String, Message>,
+    pub messages: HashMap<String, Message>,
     // Map tracking in-flight message deadlines (msg_id -> expiration_time)
-    in_flight: HashMap<String, Instant>,
+    pub in_flight: HashMap<String, Instant>,
     pub push_config: Option<PushConfig>,
     pub batch_size: usize,
     pub max_outstanding_messages: Option<usize>, // None
