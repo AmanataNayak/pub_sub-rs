@@ -1,46 +1,100 @@
 use std::time::Duration;
 use reqwest::Client;
+use reqwest::header::{HeaderMap, HeaderName, HeaderValue, CONTENT_TYPE};
 use crate::engine::Engine;
 use crate::model::{PushConfig};
 use tokio::time::interval;
 use tokio::sync::Notify;
 use std::sync::Arc;
+use tokio::task::JoinSet;
 
-pub fn spawn_push_workers(topic_name: String, sub_name: String, push_config: PushConfig, notify: Arc<Notify>, engine: Engine) {
+pub fn spawn_push_workers(topic_name: String, sub_name: String, push_config: PushConfig, batch_size: usize, notify: Arc<Notify>, engine: Engine) {
     tokio::spawn(async move {
+        let timeout = Duration::from_secs(push_config.timeout_secs.max(1));
+
+        // pre-build static custom header once outside the worker loop
+        let mut default_headers = HeaderMap::new();
+        default_headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/octet-stream"));
+
+        for (k, v) in &push_config.headers {
+            if let (Ok(name), Ok(val)) = (HeaderName::from_bytes(k.as_bytes()), HeaderValue::from_str(v)) {
+                default_headers.insert(name, val);
+            }
+        }
+
+        // Configure HTTP Client with persistent connection pooling
+
         let client = Client::builder()
-            .timeout(Duration::from_secs(push_config.timeout_secs.max(1)))
+            .timeout(timeout)
+            .default_headers(default_headers)
+            .pool_max_idle_per_host(100)
             .build()
             .unwrap_or_else(|_| Client::new());
 
-        let mut ticker = interval(Duration::from_secs(push_config.timeout_secs.max(1)));
+        let mut ticker = interval(timeout);
 
         loop {
-            if let Ok(messages) = engine.pull_batch(&topic_name, &sub_name, Some(1)) {
-                if let Some(msg) = messages.into_iter().next() {
-                    let mut req = client.post(&push_config.push_endpoint)
-                        .body(msg.payload.clone())
-                        .header("Content-Type", "application/octet-stream")
-                        .header("X-PubSub-Message-Id", &msg.id)
-                        .header("X-PubSub-Subscription", &sub_name)
-                        .header("X-PubSub-Delivery-Attempt", msg.delivery_attempt);
+            // Inner drain loop
+            loop {
+                let messages = match engine.pull_batch(&topic_name, &sub_name, Some(batch_size)) {
+                    Ok(msgs) if !msgs.is_empty() => msgs,
+                    _ => break,
+                };
 
-                    // Inject user-defined custom headers
-                    for (k, v) in &push_config.headers {
-                        req = req.header(k, v);
-                    }
+                let mut join_set = JoinSet::new();
 
-                    if let Ok(resp) = req.send().await {
-                        if resp.status().is_success() {
-                            let _ = engine.ack_batch(&topic_name, &sub_name, &[msg.id]);
-                        } else if resp.status().is_client_error(){
-                            // Transferring clien error to DLQ for review
-                            let _ = engine.nack_batch(&topic_name, &sub_name, &[msg.id]);
+                // Concurrent HTTP DISPATCH
+                for msg in messages {
+                    let client = client.clone();
+                    let endpoint = push_config.push_endpoint.clone();
+                    let sub_name = sub_name.clone();
+
+                    join_set.spawn(async move {
+                        let resp = client
+                            .post(&endpoint)
+                            .header("X-PubSub-Message-Id", &msg.id)
+                            .header("X-PubSub-Subscription", &sub_name)
+                            .header("X-PubSub-Delivery-Attempt", msg.delivery_attempt)
+                            .body(msg.payload.clone())
+                            .send()
+                            .await;
+
+                        match resp {
+                            // Success mark for batch ack
+                            Ok(r) if r.status().is_success() => (Some(msg.id), None),
+                            // client error of NACK (DLQ/Purge)
+                            Ok(r) if r.status().is_client_error() => (None, Some(msg.id)),
+                            _ => (None, None)
+                        }
+                    });
+                }
+
+                // collect results & batch lock mutations
+                let mut ack_ids = Vec::with_capacity(batch_size);
+                let mut nack_ids = Vec::with_capacity(batch_size);
+
+
+                while let Some(res) = join_set.join_next().await {
+                    if let Ok((ack_id, nack_id)) = res {
+                        if let Some(id) = ack_id {
+                            ack_ids.push(id);
+                        }
+                        if let Some(id) = nack_id {
+                            nack_ids.push(id);
                         }
                     }
                 }
+
+                // Acquire engine write lock ONCE per batch instead of 2N times
+                if !ack_ids.is_empty() {
+                    let _ = engine.ack_batch(&topic_name, &sub_name, &ack_ids);
+                }
+                if !nack_ids.is_empty() {
+                    let _ = engine.nack_batch(&topic_name, &sub_name, &nack_ids);
+                }
             }
-            // Wait for the new publish notification OR visibility timeout ticks
+
+            // Only sleep here when ready_queue is completely empty (0 messages)
             tokio::select! {
                 _ = notify.notified() => {},
                 _ = ticker.tick() => {},
@@ -116,6 +170,7 @@ mod push_worker_tests {
             "worker-topic".to_string(),
             "worker-sub".to_string(),
             push_config,
+            1,
             notify.clone(),
             engine.clone(),
         );
@@ -207,6 +262,7 @@ mod push_worker_tests {
             "fail-topic".to_string(),
             "fail-sub".to_string(),
             push_config,
+            1,
             notify.clone(),
             engine.clone(),
         );

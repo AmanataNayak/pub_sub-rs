@@ -36,7 +36,7 @@ impl Topic {
         true
     }
 
-    pub fn create_push_subscription(&mut self, name: &str, ack_deadline: Duration, push_config: PushConfig, max_outstanding_messages: Option<usize>, dead_letter_policy: Option<DeadLetterPolicy>) -> bool {
+    pub fn create_push_subscription(&mut self, name: &str, ack_deadline: Duration, push_config: PushConfig, batch_size: usize, max_outstanding_messages: Option<usize>, dead_letter_policy: Option<DeadLetterPolicy>) -> bool {
         if self.subscription.contains_key(name) {
             return false; // Already exits
         }
@@ -45,6 +45,7 @@ impl Topic {
             name.to_string(),
             ack_deadline,
             push_config,
+            batch_size,
             max_outstanding_messages,
             dead_letter_policy
         );

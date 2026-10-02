@@ -84,6 +84,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         headers.unwrap_or_default(),
                         timeout_secs,
                         ack_deadline,
+                        Some(batch_size),
                         max_outstanding_messages,
                         dead_letter_queue,
                         max_delivery_attempts,

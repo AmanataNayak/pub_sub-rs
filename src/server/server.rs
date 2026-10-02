@@ -76,12 +76,13 @@ impl PubSubService for MyPubSubService {
 
         let ack_deadline = std::time::Duration::from_secs(req.ack_deadline_secs);
         let max_outstanding_messages: Option<usize> = req.max_outstanding_messages.map(|cap| cap as usize);
+        let batch_size = req.batch_size.map(|size| size as usize);
         let (dead_letter_queue, max_delivery_attempts) = match req.dead_letter_policy {
             Some(dlp) => (Some(dlp.dead_letter_queue), dlp.max_delivery_attempts),
             None => (None, None)
         };
 
-        let _ = self.engine.create_push_subscription(&req.topic, &req.subscription, &req.push_endpoint, req.headers, req.timeout_secs, ack_deadline, max_outstanding_messages, dead_letter_queue, max_delivery_attempts).map_err(Status::from)?;
+        let _ = self.engine.create_push_subscription(&req.topic, &req.subscription, &req.push_endpoint, req.headers, req.timeout_secs, ack_deadline, batch_size, max_outstanding_messages, dead_letter_queue, max_delivery_attempts).map_err(Status::from)?;
         Ok(Response::new(CreateSubscriptionResponse { success: true }))
     }
 
@@ -173,9 +174,15 @@ impl PubSubService for MyPubSubService {
             let mut ticker = tokio::time::interval(Duration::from_millis(200));
 
             loop {
-                // Drain any available messages from the subscription and push to gRPC stream
-                let messages = engine.pull_batch(&topic_name, &sub_name, max_request).unwrap();
-                if !messages.is_empty() {
+                // Step 1 : DRAIN LOOP
+                // Continuously pull and send batches until the engine's ready queue is completely empty
+                loop {
+                    let messages = engine.pull_batch(&topic_name, &sub_name, max_request).unwrap();
+
+                    // if the queue is empty, exit this inner loop and wait inn select
+                    if messages.is_empty() {
+                        break;
+                    }
                     let responses = StreamingPullResponse {
                         messages: messages.into_iter().map(Into::into).collect(),
                     };

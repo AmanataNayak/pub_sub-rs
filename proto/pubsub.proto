@@ -46,9 +46,10 @@ message CreatePushSubscriptionRequest {
   uint64 ack_deadline_secs = 3;
   string push_endpoint = 4;
   map<string, string> headers = 5;
-  optional uint64 timeout_secs = 6;
-  optional uint32 max_outstanding_messages = 7;
-  optional DeadLetterPolicy dead_letter_policy = 8;
+  optional uint32 batch_size = 6;
+  optional uint64 timeout_secs = 7;
+  optional uint32 max_outstanding_messages = 8;
+  optional DeadLetterPolicy dead_letter_policy = 9;
 }
 
 message PublishRequest {

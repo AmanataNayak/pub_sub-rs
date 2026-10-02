@@ -42,14 +42,14 @@ impl Subscription {
         }
     }
 
-    pub fn new_push(name: String, ack_deadline: Duration, push_config: PushConfig, max_outstanding_messages: Option<usize>, dead_letter_policy: Option<DeadLetterPolicy>) -> Self {
+    pub fn new_push(name: String, ack_deadline: Duration, push_config: PushConfig, batch_size: usize, max_outstanding_messages: Option<usize>, dead_letter_policy: Option<DeadLetterPolicy>) -> Self {
         Self {
             name,
             ack_deadline,
             messages: HashMap::new(),
             ready_queue: VecDeque::new(),
             in_flight: HashMap::new(),
-            batch_size: 1,
+            batch_size: batch_size,
             dropped_messages: 0,
             max_outstanding_messages,
             dead_letter_policy,

@@ -120,7 +120,8 @@ impl Engine {
         Ok(())
     }
 
-    pub fn create_push_subscription(&self, topic_name: &str, sub_name: &str, push_endpoint: &str, headers: HashMap<String, String>, timeout_secs: Option<u64>, ack_deadline: Duration, max_outstanding_messages: Option<usize>, dead_letter_queue: Option<String>, max_delivery_attempts: Option<u32>) -> Result<(), PubSubError> {
+    pub fn create_push_subscription(&self, topic_name: &str, sub_name: &str, push_endpoint: &str, headers: HashMap<String, String>, timeout_secs: Option<u64>, ack_deadline: Duration, batch_size: Option<usize>, max_outstanding_messages: Option<usize>, dead_letter_queue: Option<String>, max_delivery_attempts: Option<u32>) -> Result<(), PubSubError> {
+        let batch_size = batch_size.unwrap_or(1);
         // Validate DLQ
         let dead_letter_policy = if let Some(dlq_name) = dead_letter_queue {
             if self.get_topic(&dlq_name).is_err() {
@@ -147,7 +148,7 @@ impl Engine {
                 topic: topic_name.to_string(),
                 subscription: sub_name.to_string(),
                 ack_deadline_sec: ack_deadline.as_secs(),
-                batch_size: 1,
+                batch_size,
                 max_outstanding_messages,
                 dead_letter_queue: dead_letter_policy.as_ref().map(|p| p.dead_letter_queue.clone()),
                 max_delivery_attempts,
@@ -171,6 +172,7 @@ impl Engine {
                 sub_name,
                 ack_deadline,
                 push_config.clone(),
+                batch_size,
                 max_outstanding_messages,
                 dead_letter_policy,
             );
@@ -182,6 +184,7 @@ impl Engine {
             topic_name.to_string(),
             sub_name.to_string(),
             push_config.clone(),
+            batch_size,
             notify,
             self.clone()
         );
@@ -537,6 +540,7 @@ mod engine_tests {
                 custom_headers,
                 Some(5),                 // timeout_secs
                 Duration::from_secs(10), // ack_deadline
+                Some(1),              //Batch size
                 None,                    // max_outstanding_messages
                 None,                    // dead_letter_queue
                 Some(5),                 // max_delivery_attempts
