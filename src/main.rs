@@ -1,5 +1,6 @@
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::path::Path;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::time;
 use tokio::time::MissedTickBehavior;
@@ -21,8 +22,8 @@ mod workers;
 
 use engine::Engine;
 use server::MyPubSubService;
-use storage::{WalEntry, WalManager};
-
+use storage::WalManager;
+use crate::storage::SnapshotStorage;
 
 pub fn start_background_worker(engine: Arc<Engine>) {
     tokio::spawn(async move {
@@ -45,90 +46,38 @@ pub fn start_background_worker(engine: Arc<Engine>) {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let wal_path = "pubsub.wal";
+    let data_dir = Path::new("./data");
+    let storage = SnapshotStorage::new(data_dir);
 
-    // 1. First open the WAL manager
-    let wal = Arc::new(WalManager::open(wal_path)?);
+    // Load latest snapshot or initialize empty Engine
+    let (mut engine, checkpoint_lsn) = if let Some(snapshot) = storage.load_latest_snapshot()? {
+        let lsn = snapshot.header.checkpoint_lsn;
+        let restored_engine = Engine::restore_from_snapshot(snapshot);
+        (restored_engine, lsn)
+    } else {
+        (Engine::new(), 0)
+    };
 
-    // 2. Create Engine initialized with WAL
-    let engine =Arc::new(Engine::with_wal(wal));
-
-    // 3. Recover entries directly into the active engine instance
-    let recovered_entries = WalManager::recover(wal_path)?;
-    println!("Recovered {} entries from WAL", recovered_entries.len());
-
-    for entry in recovered_entries {
-        match entry {
-            WalEntry::CreateTopic { topic } => {
-                let _ = engine.create_topic(&topic);
-            }
-            WalEntry::CreateSubscription {
-                topic,
-                subscription,
-                ack_deadline_sec,
-                batch_size,
-                max_outstanding_messages,
-                dead_letter_queue,
-                max_delivery_attempts,
-                message_ttl,
-                push_endpoint,
-                headers,
-                timeout_secs,
-
-            } => {
-                let ack_deadline = Duration::from_secs(ack_deadline_sec);
-                if let Some(pe) = push_endpoint {
-                    let _ = engine.create_push_subscription(
-                        &topic,
-                        &subscription,
-                        &pe,
-                        headers.unwrap_or_default(),
-                        timeout_secs,
-                        ack_deadline,
-                        Some(batch_size),
-                        max_outstanding_messages,
-                        message_ttl,
-                        dead_letter_queue,
-                        max_delivery_attempts,
-                    );
-                } else {
-                    let _ = engine.create_subscription(
-                        &topic,
-                        &subscription,
-                        ack_deadline,
-                        Some(batch_size),
-                        max_outstanding_messages,
-                        message_ttl,
-                        dead_letter_queue,
-                        max_delivery_attempts,
-                    );
-                }
-            }
-            WalEntry::Publish { topic, message } => {
-                let _ = engine.publish(&topic, message);
-            }
-            WalEntry::Ack {
-                topic,
-                subscription,
-                message_ids,
-            } => {
-                let _ = engine.ack_batch(&topic, &subscription, &message_ids);
-            }
-            WalEntry::Nack {
-                topic,
-                subscription,
-                message_ids
-            } => {
-                let _ = engine.nack_batch(&topic, &subscription, &message_ids);
+    // Replay log entries from WAL that occured after checkpoint_lsn
+    let wal = WalManager::open_and_replay(data_dir, |lsn, entry| {
+        if lsn > checkpoint_lsn {
+            if let Err(e) = engine.apply_wal_entry(entry) {
+                eprintln!("Failed to apply WAL entry at LSN {}: {:?}", lsn, e);
             }
         }
-    }
+    })?;
+
+    // Attach active WalManager (wrapped in Mutex) for live traffic
+    engine.wal = Some(Arc::new(Mutex::new(wal)));
+
+    //  Wrap in Arc for concurrent gRPC/HTTP handlers
+    let engine_arc = Arc::new(engine);
 
     // 4. Start the background worker
-    start_background_worker(Arc::clone(&engine));
+    start_background_worker(Arc::clone(&engine_arc));
 
     // 4. Instantiate gRPC Service wrapper
-    let pubsub_service = MyPubSubService::new(Arc::clone(&engine));
+    let pubsub_service = MyPubSubService::new(Arc::clone(&engine_arc));
 
     // 5. Bind gRPC server to 0.0.0.0:50051
     let addr: SocketAddr = "0.0.0.0:50051".parse()?;

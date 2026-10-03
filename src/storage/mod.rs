@@ -12,3 +12,4 @@ pub use dto::{
     PushConfigState,
     SnapshotHeader
 };
+pub use snapshot_storage::SnapshotStorage;

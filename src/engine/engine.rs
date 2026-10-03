@@ -1,6 +1,6 @@
 use std::alloc::System;
 use std::collections::HashMap;
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::Notify;
 use crate::engine::topic::Subscription;
@@ -19,7 +19,7 @@ pub struct Engine {
     // topics: Arc<RwLock<HashMap<String, Topic>>>,
     // Each topic is wrapped in its own Arc<RwLoc<...>>
     topics: Arc<RwLock<HashMap<String, Arc<RwLock<Topic>>>>>,
-    wal: Option<Arc<WalManager>>
+    pub(crate) wal: Option<Arc<Mutex<WalManager>>>
 }
 
 
@@ -31,7 +31,7 @@ impl Engine {
         }
     }
 
-    pub fn with_wal(wal: Arc<WalManager>) -> Self {
+    pub fn with_wal(wal: Arc<Mutex<WalManager>>) -> Self {
         Self {
             topics: Arc::new(RwLock::new(HashMap::new())),
             wal: Some(wal)
@@ -60,7 +60,9 @@ impl Engine {
             let entry = WalEntry::CreateTopic {
                 topic: name.to_string()
             };
-            wal.append(&entry)
+            wal.lock()
+                .unwrap()
+                .append(&entry)
                 .map_err(|e| PubSubError::IoError(e.to_string()))?;
         }
         let topic = Arc::new(RwLock::new(Topic::new(name.to_string())));
@@ -107,7 +109,9 @@ impl Engine {
                 timeout_secs: None,
                 headers: None
             };
-            wal.append(&entry)
+            wal.lock()
+                .unwrap()
+                .append(&entry)
                 .map_err(|e| PubSubError::IoError(e.to_string()))?;
         }
 
@@ -161,7 +165,9 @@ impl Engine {
                 timeout_secs: Some(push_config.timeout_secs),
                 headers: Some(push_config.headers.clone()),
             };
-            wal.append(&entry)
+            wal.lock()
+                .unwrap()
+                .append(&entry)
                 .map_err(|e| PubSubError::IoError(e.to_string()))?;
         }
 
@@ -209,7 +215,9 @@ impl Engine {
                 topic: topic_name.to_string(),
                 message: msg.clone()
             };
-            wal.append(&entry)
+            wal.lock()
+                .unwrap()
+                .append(&entry)
                 .map_err(|e| PubSubError::IoError(e.to_string()))?;
         }
 
@@ -251,7 +259,9 @@ impl Engine {
                 subscription: sub_name.to_string(),
                 message_ids: message_ids.to_vec(),
             };
-            wal.append(&entry)
+            wal.lock()
+                .unwrap()
+                .append(&entry)
                 .map_err(|e| PubSubError::IoError(e.to_string()))?;
         }
 
@@ -318,7 +328,9 @@ impl Engine {
                     subscription: sub_name.to_string(),
                     message_ids: message_ids.to_vec(),
                 };
-                wal.append(&entry)
+                wal.lock()
+                    .unwrap()
+                    .append(&entry)
                     .map_err(|e| PubSubError::IoError(e.to_string()))?;
             }
 
@@ -516,6 +528,79 @@ impl Engine {
         }
         engine
 
+    }
+
+    pub fn apply_wal_entry(&self, entry: WalEntry) -> std::io::Result<()> {
+        match entry {
+            WalEntry::CreateTopic { topic } => {
+                self.create_topic(&topic)
+                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+            }
+            WalEntry::CreateSubscription {
+                topic,
+                subscription,
+                ack_deadline_sec,
+                batch_size,
+                max_outstanding_messages,
+                dead_letter_queue,
+                max_delivery_attempts,
+                message_ttl,
+                push_endpoint,
+                headers,
+                timeout_secs,
+            } => {
+                let ack_deadline = Duration::from_secs(ack_deadline_sec);
+                if let Some(pe) = push_endpoint {
+                    self.create_push_subscription(
+                        &topic,
+                        &subscription,
+                        &pe,
+                        headers.unwrap_or_default(),
+                        timeout_secs,
+                        ack_deadline,
+                        Some(batch_size),
+                        max_outstanding_messages,
+                        message_ttl,
+                        dead_letter_queue,
+                        max_delivery_attempts,
+                    )
+                        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+                } else {
+                    self.create_subscription(
+                        &topic,
+                        &subscription,
+                        ack_deadline,
+                        Some(batch_size),
+                        max_outstanding_messages,
+                        message_ttl,
+                        dead_letter_queue,
+                        max_delivery_attempts,
+                    )
+                        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+                }
+            }
+            WalEntry::Publish { topic, message } => {
+                self.publish(&topic, message)
+                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+            }
+            WalEntry::Ack {
+                topic,
+                subscription,
+                message_ids,
+            } => {
+                self.ack_batch(&topic, &subscription, &message_ids)
+                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+            }
+            WalEntry::Nack {
+                topic,
+                subscription,
+                message_ids,
+            } => {
+                self.nack_batch(&topic, &subscription, &message_ids)
+                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+            }
+        }
+        Ok(())
     }
 }
 
