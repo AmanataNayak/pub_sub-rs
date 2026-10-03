@@ -2,13 +2,16 @@ use std::alloc::System;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use tokio::sync::Notify;
+use tokio::sync::{watch, Notify};
+use tokio::time;
+use tokio::time::MissedTickBehavior;
+use crate::storage::CompactorConfig;
 use crate::engine::topic::Subscription;
 pub use crate::engine::topic::Topic;
 use crate::errors::PubSubError;
 use crate::model::{DeadLetterPolicy, Message, PushConfig};
 use crate::workers::spawn_push_workers;
-use crate::storage::{DeadLetterPolicyState, PersistentMessage, PushConfigState, SubscriptionState, TopicState, WalEntry, WalManager, SnapshotHeader};
+use crate::storage::{DeadLetterPolicyState, PersistentMessage, PushConfigState, SubscriptionState, TopicState, WalEntry, WalManager, SnapshotHeader, SnapshotStorage, run_compaction_pass};
 use crate::storage::{EngineSnapshot};
 
 
@@ -281,7 +284,11 @@ impl Engine {
         Ok(sub.notify_handler())
     }
 
+
+    /// Two-pass optimized expiry sweep: inspects state under read locks first
+    /// to prevent write-lock contention on active gRPC threads.
     pub fn process_expired_messages(&self) {
+        let now_instant = Instant::now();
         let mut dead_letters = Vec::new();
 
         // Collect arc pointers to all topics and drop the outer self.topics lock
@@ -292,16 +299,43 @@ impl Engine {
 
         // Iterate each topic, acquire its write lock & run requeue_expired()
         for topic_arc in topic_arcs {
-            let mut topic = topic_arc.write().unwrap();
+            // PASS 1: Inspect under READ lock & collect subscription names that need eviction
+            let sub_to_evicts: Vec<String> = {
+                let topic = topic_arc.read().unwrap();
+                topic
+                    .subscription
+                    .values()
+                    .filter_map(|sub| {
+                        let has_expired_in_flight =
+                            sub.in_flight.values().any(|deadline| *deadline <= now_instant);
+                        let has_expired_ttl = sub.message_ttl.map_or(false, |ttl| {
+                            sub.messages.values().any(|msg| {
+                                now_instant.saturating_duration_since(msg.created_at) >= ttl
+                            })
+                        });
 
-            // Iterate mutably through all subscriptions inside this topic
-            for sub in topic.subscription.values_mut() {
-                let evicted = sub.requeue_expired();
-                dead_letters.extend(evicted);
-                // sweep the messages
-                sub.sweep_expired_ttl();
+                        if has_expired_ttl || has_expired_in_flight {
+                            Some(sub.name.clone())
+                        } else {
+                            None
+                        }
+                    })
+                    .collect()
+            }; // READ lock on topic_arc is dropped HERE
+
+            // PASS 2: Acquire WRITE lock only if subscription actually need evicition
+            if !sub_to_evicts.is_empty() {
+                let mut topic = topic_arc.write().unwrap();
+
+                for sub_name in sub_to_evicts {
+                    if let Some(sub_mut) = topic.subscription.get_mut(&sub_name) {
+                        let evicted = sub_mut.requeue_expired();
+                        dead_letters.extend(evicted);
+                        sub_mut.sweep_expired_ttl();
+                    }
+                }
             }
-        } // All `Topic` write locks are dropped HERE
+        }
 
         // Now that ALL locks are released, route dead-letter messages safely
         for (dlq, msg) in dead_letters {
@@ -602,6 +636,63 @@ impl Engine {
         }
         Ok(())
     }
+
+    /// Starts both background workers (expiry janitor + compactor) attached to Engine lifecycle.
+    pub fn start_workers(
+        self: &Arc<Self>,
+        storage: Arc<SnapshotStorage>,
+        config: CompactorConfig,
+        mut shutdown_rx: watch::Receiver<bool>
+    ) {
+        // Task 1: Expiry Janitor
+        let engine_janitor = Arc::clone(self);
+        let mut rx_janitor = shutdown_rx.clone();
+
+        tokio::spawn(async move {
+            let mut interval = time::interval(Duration::from_secs(1));
+            interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
+
+            loop {
+                tokio::select! {
+                    _ = interval.tick() => {
+                        let engine_ref = Arc::clone(&engine_janitor);
+                        let _ = tokio::task::spawn_blocking(move || {
+                            engine_ref.process_expired_messages();
+                        }).await;
+                    }
+                    _ = rx_janitor.changed() => {
+                        println!("[Janitor] Worker shutting down cleanly.");
+                        break;
+                    }
+                }
+            }
+        });
+
+        // Task 2: Log Compactor
+        let engine_compactor = Arc::clone(self);
+        tokio::spawn(async move {
+            let mut interval = time::interval(config.check_interval);
+            interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
+
+            loop {
+                tokio::select! {
+                    _ = interval.tick() => {
+                        let engine_ref = Arc::clone(&engine_compactor);
+                        let storage_ref = Arc::clone(&storage);
+                        let _ = tokio::task::spawn_blocking(move || {
+                            if let Err(e) = run_compaction_pass(&engine_ref, &storage_ref, config.max_bytes_threshold) {
+                                eprintln!("[Compactor Error] Snapshot failed: {:?}", e);
+                            }
+                        }).await;
+                    }
+                    _ = shutdown_rx.changed() => {
+                        println!("[Compactor] Worker shutting down cleanly.");
+                        break;
+                    }
+                }
+            }
+        });
+    }
 }
 
 
@@ -619,6 +710,7 @@ mod engine_tests
     use std::thread::sleep;
     use std::time::Instant;
     use bytes::Bytes;
+    use tempfile::tempdir;
 
     fn dummy_msg(payload_str: &str) -> Message {
         Message::new(bytes::Bytes::from(payload_str.as_bytes().to_vec()), HashMap::new())
@@ -1248,5 +1340,52 @@ mod engine_tests
 
         assert_eq!(pulled_a[0].id, "shared-msg");
         assert_eq!(pulled_b[0].id, "shared-msg");
+    }
+
+    #[tokio::test]
+    async fn test_optimized_expiry_avoids_unnecessary_write_locks() {
+        let engine = Engine::new();
+        engine.create_topic("orders").unwrap();
+        engine.create_subscription("orders", "sub1", Duration::from_secs(30), Some(10), None, None, None, None).unwrap();
+
+        // Publish a message but DO NOT expire it
+        engine.publish("orders", mock_message("msg-1")).unwrap();
+
+        // Run process_expired_messages — should perform 0 writes / lock acquisitions
+        engine.process_expired_messages();
+
+        // Message remains in ready queue untouched
+        let snap = engine.create_snapshot(1);
+        assert_eq!(snap.messages.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_graceful_shutdown_forces_final_snapshot() {
+        let dir = tempdir().unwrap();
+        let data_dir = dir.path();
+        let storage = Arc::new(SnapshotStorage::new(data_dir));
+
+        let mut engine = Engine::new();
+        let wal = WalManager::open_and_replay(data_dir, |_, _| {}).unwrap();
+        engine.wal = Some(Arc::new(Mutex::new(wal)));
+
+        let engine_arc = Arc::new(engine);
+        engine_arc.create_topic("orders").unwrap();
+
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+
+        // Start background tasks
+        engine_arc.start_workers(Arc::clone(&storage), CompactorConfig::default(), shutdown_rx);
+
+        // Simulate SIGINT / Ctrl+C
+        shutdown_tx.send(true).unwrap();
+
+        // Force a final compaction pass with 0 byte threshold
+        let flushed = run_compaction_pass(&engine_arc, &storage, 0).unwrap();
+        assert!(flushed, "Final shutdown pass must force-flush uncommitted WAL state");
+
+        let loaded = storage.load_latest_snapshot().unwrap();
+        assert!(loaded.is_some());
+        assert!(loaded.unwrap().topics.contains_key("orders"));
     }
 }

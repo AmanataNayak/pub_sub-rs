@@ -1,9 +1,7 @@
 use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
-use tokio::time;
-use tokio::time::MissedTickBehavior;
+use tokio::sync::watch;
 use tonic::transport::Server;
 
 // Include tonic generated protobuf module
@@ -23,42 +21,24 @@ mod workers;
 use engine::Engine;
 use server::MyPubSubService;
 use storage::WalManager;
-use crate::storage::SnapshotStorage;
-
-pub fn start_background_worker(engine: Arc<Engine>) {
-    tokio::spawn(async move {
-       let mut interval = time::interval(Duration::from_millis(50));
-
-        interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
-
-        loop {
-            interval.tick().await;
-
-            let engine_ref = Arc::clone(&engine);
-            // Offload CPU/blocking lock operations off Tokio worker threads
-            let _ = tokio::task::spawn_blocking(move || {
-                engine_ref.process_expired_messages();
-            }).await;
-        }
-    });
-}
+use crate::storage::{run_compaction_pass, SnapshotStorage, CompactorConfig};
 
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let data_dir = Path::new("./data");
-    let storage = SnapshotStorage::new(data_dir);
+    let storage = Arc::new(SnapshotStorage::new(data_dir));
 
-    // Load latest snapshot or initialize empty Engine
+    // 1. Restore state or initialize empty Engine
     let (mut engine, checkpoint_lsn) = if let Some(snapshot) = storage.load_latest_snapshot()? {
+        println!("Restored snapshot at LSN {}", snapshot.header.checkpoint_lsn);
         let lsn = snapshot.header.checkpoint_lsn;
-        let restored_engine = Engine::restore_from_snapshot(snapshot);
-        (restored_engine, lsn)
+        (Engine::restore_from_snapshot(snapshot), lsn)
     } else {
         (Engine::new(), 0)
     };
 
-    // Replay log entries from WAL that occured after checkpoint_lsn
+    // 2. Replay post-snapshot log records
     let wal = WalManager::open_and_replay(data_dir, |lsn, entry| {
         if lsn > checkpoint_lsn {
             if let Err(e) = engine.apply_wal_entry(entry) {
@@ -67,27 +47,43 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     })?;
 
-    // Attach active WalManager (wrapped in Mutex) for live traffic
+    // 3. Attach active WAL Manager while engine is still a local mutable variable
     engine.wal = Some(Arc::new(Mutex::new(wal)));
 
-    //  Wrap in Arc for concurrent gRPC/HTTP handlers
+    // 4. Wrap Engine in Arc
     let engine_arc = Arc::new(engine);
 
-    // 4. Start the background worker
-    start_background_worker(Arc::clone(&engine_arc));
+    // 5. Setup shutdown channel and start workers via Engine
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let compactor_config = CompactorConfig::default();
 
-    // 4. Instantiate gRPC Service wrapper
+    engine_arc.start_workers(Arc::clone(&storage), compactor_config, shutdown_rx);
+
+    // 6. Bind gRPC Service
     let pubsub_service = MyPubSubService::new(Arc::clone(&engine_arc));
-
-    // 5. Bind gRPC server to 0.0.0.0:50051
     let addr: SocketAddr = "0.0.0.0:50051".parse()?;
     println!("Pub/Sub gRPC server running on {}", addr);
 
+    // 7. Serve gRPC with graceful shutdown listener
     Server::builder()
         .add_service(PubSubServiceServer::new(pubsub_service))
-        .serve(addr)
+        .serve_with_shutdown(addr, async move {
+            tokio::signal::ctrl_c().await.expect("Failed to listen for ctrl_c");
+            println!("\nShutdown signal received. Stopping background tasks...");
+
+            // Notify background workers
+            let _ = shutdown_tx.send(true);
+
+            // Force final snapshot pass (max_bytes_threshold = 0)
+            println!("Performing final WAL flush & snapshot...");
+            if let Err(e) = run_compaction_pass(&engine_arc, &storage, 0) {
+                eprintln!("Error during final shutdown snapshot: {:?}", e);
+            } else {
+                println!("Final snapshot written successfully.");
+            }
+        })
         .await?;
 
+    println!("Server shut down cleanly.");
     Ok(())
 }
-
