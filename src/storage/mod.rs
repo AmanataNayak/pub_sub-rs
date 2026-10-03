@@ -1,5 +1,6 @@
 pub mod wal;
 mod dto;
+mod snapshot_storage;
 
 pub use wal::{WalEntry, WalManager};
 pub use dto::{
